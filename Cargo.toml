@@ -1,0 +1,144 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rt-protocol",
+    "crates/rt-core",
+    "crates/rt-server",
+    "crates/rt-client",
+    "crates/rt-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+authors = ["RemoteTerminal"]
+description = "Modular remote control toolkit for Windows (client + server in one binary)"
+
+[workspace.dependencies]
+# --- workspace crates ---
+rt-protocol = { path = "crates/rt-protocol" }
+rt-core = { path = "crates/rt-core" }
+rt-server = { path = "crates/rt-server" }
+rt-client = { path = "crates/rt-client" }
+
+# --- error / serialization ---
+anyhow = "1.0"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = { version = "0.8", features = ["preserve_order"] }
+
+# --- async runtime / http ---
+tokio = { version = "1.40", features = [
+    "rt-multi-thread",
+    "macros",
+    "fs",
+    "io-util",
+    "net",
+    "process",
+    "sync",
+    "time",
+    "signal",
+] }
+tokio-util = { version = "0.7", features = ["io"] }
+axum = { version = "0.8", features = ["ws", "multipart", "macros", "query"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace", "limit", "compression-gzip"] }
+futures-util = "0.3"
+bytes = "1.7"
+http = "1.1"
+url = "2.5"
+mime_guess = "2.0"
+tokio-tungstenite = { version = "0.26", default-features = false, features = [
+    "connect",
+    "handshake",
+    "rustls",
+] }
+
+# --- tls ---
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2.1"
+rcgen = "0.13"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls-tls-manual-roots",
+    "charset",
+    "http2",
+] }
+
+# --- crypto / auth ---
+argon2 = "0.5"
+sha2 = "0.10"
+hmac = "0.12"
+subtle = "2.6"
+rand = "0.8"
+zeroize = "1.8"
+base64 = "0.22"
+hex = "0.4"
+uuid = { version = "1.10", features = ["v4", "serde"] }
+encoding_rs = "0.8"
+
+# --- logging ---
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = [
+    "env-filter",
+    "fmt",
+    "json",
+    "ansi",
+    "registry",
+    "chrono",
+] }
+tracing-appender = "0.2"
+
+# --- platform / system info ---
+sysinfo = "0.40"
+xcap = "0.9"
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "webp",
+] }
+portable-pty = "0.9"
+hostname = "0.4"
+local-ip-address = "0.6"
+dirs = "6.0"
+fs2 = "0.4"
+open = "5.3"
+
+# --- gui ---
+eframe = { version = "0.37", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "persistence",
+] }
+egui = "0.37"
+egui_extras = { version = "0.37", features = ["image", "datepicker"] }
+rfd = "0.15"
+
+# --- misc ---
+chrono = { version = "0.4", features = ["serde", "clock"] }
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+tempfile = "3.13"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+incremental = false
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

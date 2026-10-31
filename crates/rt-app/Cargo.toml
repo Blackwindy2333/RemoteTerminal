@@ -1,0 +1,39 @@
+[package]
+name = "rt-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RemoteTerminal desktop app (GUI + CLI + MCP server)"
+
+[[bin]]
+name = "remote-terminal"
+path = "src/main.rs"
+
+[lib]
+name = "rt_app"
+path = "src/lib.rs"
+
+[dependencies]
+rt-protocol = { workspace = true }
+rt-core = { workspace = true }
+rt-server = { workspace = true }
+rt-client = { workspace = true }
+
+eframe = { workspace = true }
+egui = { workspace = true }
+egui_extras = { workspace = true }
+rfd = { workspace = true }
+image = { workspace = true }
+
+clap = { workspace = true }
+tokio = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+open = { workspace = true }

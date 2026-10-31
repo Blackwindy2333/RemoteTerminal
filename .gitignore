@@ -1,0 +1,40 @@
+# ---- runtime artifacts (never committed) ----
+# local configuration produced at first start
+/config.toml
+/config.local.toml
+*.local.toml
+
+# logs & audit trail
+/logs/
+*.log
+*.log.*
+/audit/
+
+# runtime data: tls material, workspace jail, temp transfers
+/data/
+/workspace/
+/captures/
+/downloads/
+/uploads/
+
+# crash / evidence dumps
+*.dmp
+crashes/
+/tmp/
+
+# ---- build artifacts ----
+/target/
+**/target/
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# ---- editors / os ----
+/.idea/
+/.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
