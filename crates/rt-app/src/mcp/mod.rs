@@ -301,7 +301,7 @@ mod tests {
             .await
             .unwrap();
         let tools = reply["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 18);
     }
 
     #[tokio::test]

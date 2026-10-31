@@ -189,6 +189,11 @@ impl Bridge {
                 }),
             ),
             tool(
+                "rt_fs_roots",
+                "Discover where you may browse: the scope root, drives (full scope) and quick paths.",
+                json!({}),
+            ),
+            tool(
                 "rt_fs_list",
                 "List a remote directory (scope-checked path).",
                 json!({"path": {"type": "string", "description": "Directory path; omit for the scope root."}}),
@@ -313,6 +318,7 @@ impl Bridge {
         match name {
             "rt_info" => self.json(self.client.info().await),
             "rt_exec" => self.exec(args).await,
+            "rt_fs_roots" => self.json(self.client.roots().await),
             "rt_fs_list" => {
                 let path = arg_str(args, "path").unwrap_or_default();
                 self.json(self.client.list(&path).await)
@@ -685,7 +691,7 @@ mod tests {
     #[test]
     fn tool_definitions_are_well_formed() {
         let tools = Bridge::tool_definitions();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 18);
         for tool in &tools {
             assert!(tool["name"].as_str().unwrap().starts_with("rt_"));
             assert!(tool["inputSchema"]["type"] == "object");
