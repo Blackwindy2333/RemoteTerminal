@@ -1068,6 +1068,44 @@ async fn workspace_sessions_cannot_execute_or_capture() {
 }
 
 #[tokio::test]
+async fn process_listing_requires_full_scope() {
+    let fx = Fixture::new();
+    let worker = fx.token("worker").await;
+    let admin = fx.token("admin").await;
+
+    // The process table exposes command lines and user names host-wide.
+    let (status, _, body) = split(
+        fx.call(authed_get("/api/v1/sysinfo/processes", &worker))
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "forbidden", "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("full scope"),
+        "{body}"
+    );
+    let status = fx
+        .call(authed_get("/api/v1/sysinfo/processes?limit=5", &admin))
+        .await
+        .status();
+    assert_ne!(
+        status,
+        StatusCode::FORBIDDEN,
+        "admin must keep the process table"
+    );
+
+    // Hardware and load overviews stay part of the workspace experience.
+    for uri in ["/api/v1/sysinfo", "/api/v1/sysinfo/quick"] {
+        let (status, _, body) = split(fx.call(authed_get(uri, &worker)).await).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+    }
+}
+
+#[tokio::test]
 async fn websocket_streams_enforce_the_session_scope() {
     let fx = Fixture::new();
     let worker = fx.token("worker").await;

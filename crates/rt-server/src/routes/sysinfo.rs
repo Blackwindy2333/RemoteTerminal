@@ -8,7 +8,7 @@ use rt_core::sysinfo::ProcessQuery;
 use rt_protocol::{ProcessListResponse, QuickStatus, SysInfoSnapshot};
 use serde::Deserialize;
 
-use crate::middleware::{blocking, session_of, ApiQuery, ApiResult};
+use crate::middleware::{blocking, require_full_scope, session_of, ApiQuery, ApiResult};
 use crate::state::AppState;
 
 /// `GET /api/v1/sysinfo/processes?limit=&query=&sort=&descending=`.
@@ -47,12 +47,17 @@ pub(crate) async fn quick(
 }
 
 /// `GET /api/v1/sysinfo/processes` — sampled task list.
+///
+/// The snapshot and quick status stay available to workspace sessions (a
+/// hardware overview is part of the product), but the process table exposes
+/// command lines and user names host-wide, so `processes` = full scope only.
 pub(crate) async fn processes(
     State(state): State<Arc<AppState>>,
     ApiQuery(query): ApiQuery<ProcessesQuery>,
     req: Request,
 ) -> ApiResult<Json<ProcessListResponse>> {
-    let _ctx = session_of(&req)?;
+    let ctx = session_of(&req)?;
+    require_full_scope(&ctx, "listing remote processes")?;
     let service = state.sysinfo();
     let ceiling = state.cfg().server.max_list_entries.max(1);
     let spec = ProcessQuery {

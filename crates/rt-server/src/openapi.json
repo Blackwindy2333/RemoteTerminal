@@ -404,7 +404,7 @@
     "/api/v1/sysinfo": {
       "get": {
         "tags": ["sysinfo"],
-        "summary": "Full machine snapshot",
+        "summary": "Full machine snapshot (workspace sessions see hardware and load only)",
         "responses": {
           "200": {
             "description": "Snapshot",
@@ -432,7 +432,7 @@
     "/api/v1/sysinfo/processes": {
       "get": {
         "tags": ["sysinfo"],
-        "summary": "Process table",
+        "summary": "Process table (full scope only)",
         "parameters": [
           { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 200 } },
           { "name": "query", "in": "query", "schema": { "type": "string" } },
@@ -449,7 +449,8 @@
             "content": {
               "application/json": { "schema": { "$ref": "#/components/schemas/ProcessListResponse" } }
             }
-          }
+          },
+          "403": { "$ref": "#/components/responses/Forbidden" }
         }
       }
     },
