@@ -30,7 +30,7 @@ window.
 | Files | list / stat / mkdir / delete / rename / copy / ranged read / streaming upload+download with SHA-256; **workspace jail** or **full access** per session |
 | System info | CPU, memory, disks, network interfaces, displays, battery, uptime, process list, app/server state |
 | Screen | monitor and window enumeration, single-frame PNG/JPEG capture (primary / one monitor / all monitors / one window), optional low-fps live preview |
-| Interfaces | REST + WebSocket + `openapi.json` + MCP stdio bridge with 17 tools |
+| Interfaces | REST + WebSocket + `openapi.json` + MCP stdio bridge with 18 tools |
 | Safety | TLS 1.3 with pinned self-signed certificate, argon2id passwords, hashed session tokens, API keys, login lockout + rate limit + IP allowlist, audit log, path jail |
 | Ops | config in `config.toml` (created on first run), rotating logs, JSON audit trail, single-instance guard |
 

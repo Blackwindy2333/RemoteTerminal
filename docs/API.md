@@ -204,9 +204,9 @@ Invoke-WebRequest -Uri "$base/api/v1/capture/raw?target=primary&format=png" `
 ## 8. MCP bridge (recommended for harness tools)
 
 `remote-terminal.exe mcp` speaks JSON-RPC 2.0 over stdin/stdout (one JSON
-message per line) and exposes 17 tools:
+message per line) and exposes 18 tools:
 
-`rt_info`, `rt_exec`, `rt_fs_list`, `rt_fs_stat`, `rt_fs_read`, `rt_fs_write`,
+`rt_info`, `rt_exec`, `rt_fs_roots`, `rt_fs_list`, `rt_fs_stat`, `rt_fs_read`, `rt_fs_write`,
 `rt_fs_mkdir`, `rt_fs_delete`, `rt_fs_rename`, `rt_fs_copy`, `rt_fs_download`,
 `rt_fs_upload`, `rt_sysinfo`, `rt_processes`, `rt_screens`, `rt_windows`,
 `rt_capture`.
