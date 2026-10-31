@@ -373,6 +373,20 @@ pub fn delete(guard: &PathGuard, req: &DeleteRequest) -> Result<DeleteResult> {
     Ok(DeleteResult { deleted, failed })
 }
 
+/// Rejects a read-only entry unless the caller allowed clearing the attribute.
+///
+/// The check cannot be delegated to the OS: `std::fs::remove_file` clears
+/// `FILE_ATTRIBUTE_READONLY` and retries on Windows, which would silently
+/// discard the attribute and make `even_if_readonly` meaningless.
+fn check_readonly(label: &str, attrs: u32, clear_ro: bool) -> Result<()> {
+    if !clear_ro && util::is_readonly(attrs) {
+        return Err(RtError::Forbidden(format!(
+            "`{label}` is read-only (set even_if_readonly=true)"
+        )));
+    }
+    Ok(())
+}
+
 fn delete_one(
     guard: &PathGuard,
     path: &str,
@@ -395,6 +409,7 @@ fn delete_one(
     }
 
     if meta.is_dir() {
+        check_readonly(&guard.display(&real), attrs, even_if_readonly)?;
         if !recursive {
             // Check emptiness ourselves: Windows reports "not empty" as a
             // generic error, which would surface as an opaque `internal_error`.
@@ -418,6 +433,7 @@ fn delete_one(
         return Ok(guard.display(&real));
     }
 
+    check_readonly(&guard.display(&real), attrs, even_if_readonly)?;
     if even_if_readonly {
         util::clear_readonly(&io_real)?;
     }
@@ -476,12 +492,14 @@ fn remove_children(dir: &Path, clear_ro: bool) -> Result<()> {
             }
             remove_link(&child).map_err(|e| io_err(&child, e))?;
         } else if meta.is_dir() {
+            check_readonly(&child.display().to_string(), attrs, clear_ro)?;
             remove_children(&child, clear_ro)?;
             if clear_ro {
                 util::clear_readonly(&child)?;
             }
             std::fs::remove_dir(&child).map_err(|e| io_err(&child, e))?;
         } else {
+            check_readonly(&child.display().to_string(), attrs, clear_ro)?;
             if clear_ro {
                 util::clear_readonly(&child)?;
             }
@@ -1079,5 +1097,804 @@ pub fn is_existing_dir(guard: &PathGuard, path: &str) -> bool {
             .map(|meta| meta.is_dir())
             .unwrap_or(false),
         Err(_) => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rt_protocol::{ErrorCode, Scope};
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// A fresh workspace jail rooted at an empty temp directory.
+    fn workspace() -> (TempDir, PathGuard) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let guard = PathGuard::new(Scope::Workspace, Some(dir.path())).expect("workspace guard");
+        (dir, guard)
+    }
+
+    fn limits() -> FsLimits {
+        FsLimits::default()
+    }
+
+    /// Creates `rel` (relative to the temp root) with the given bytes.
+    fn put(dir: &TempDir, rel: &str, data: &[u8]) -> PathBuf {
+        let path = dir.path().join(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create parent");
+        }
+        fs::write(&path, data).expect("write fixture");
+        path
+    }
+
+    fn code(err: &RtError) -> ErrorCode {
+        err.code()
+    }
+
+    fn assert_code<T: std::fmt::Debug>(result: Result<T>, expected: ErrorCode) {
+        match result {
+            Ok(value) => panic!("expected {expected:?}, got Ok({value:?})"),
+            Err(err) => assert_eq!(code(&err), expected, "unexpected error: {err}"),
+        }
+    }
+
+    /// Names of leftover staging files (a failed write must not leave any).
+    fn temp_files(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .expect("read_dir")
+            .filter_map(|item| item.ok())
+            .map(|item| item.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect()
+    }
+
+    fn body(limit: usize) -> FsLimits {
+        FsLimits::new(limit, limit as u64, limit as u64)
+    }
+
+    #[test]
+    fn rejects_paths_outside_the_jail() {
+        let (_dir, guard) = workspace();
+        for escaped in ["..\\..\\x", "..\\x", "\\..\\..\\x", "sub\\..\\..\\..\\x"] {
+            assert_code(list(&guard, escaped, &limits()), ErrorCode::ScopeViolation);
+            assert_code(read(&guard, escaped, 0, None, &limits()), ErrorCode::ScopeViolation);
+            assert_code(
+                write(&guard, escaped, b"x", true, true, &limits()),
+                ErrorCode::ScopeViolation,
+            );
+            let batch = delete(
+                &guard,
+                &DeleteRequest {
+                    paths: vec![escaped.to_string()],
+                    recursive: true,
+                    even_if_readonly: true,
+                },
+            )
+            .expect("delete reports failures per path");
+            assert_eq!(batch.failed.len(), 1, "{escaped} must not be deletable");
+            assert_eq!(batch.failed[0].code, ErrorCode::ScopeViolation);
+        }
+        // An absolute path outside the workspace root is just as unacceptable.
+        assert_code(
+            read(&guard, "C:\\Windows\\win.ini", 0, None, &limits()),
+            ErrorCode::ScopeViolation,
+        );
+    }
+
+    #[test]
+    fn list_sorts_directories_first_and_reports_parent() {
+        let (dir, guard) = workspace();
+        put(&dir, "b.txt", b"b");
+        put(&dir, "A.txt", b"a");
+        fs::create_dir(dir.path().join("beta")).expect("dir");
+        fs::create_dir(dir.path().join("Alpha")).expect("dir");
+
+        let response = list(&guard, "\\", &limits()).expect("list root");
+        assert_eq!(response.path, "\\");
+        assert!(response.parent.is_none(), "root has no parent");
+        let names: Vec<&str> = response.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["Alpha", "beta", "A.txt", "b.txt"]);
+        assert!(response.entries[0].is_dir && response.entries[1].is_dir);
+        assert_eq!(response.total_entries, Some(4));
+        assert!(!response.truncated);
+        assert_eq!(response.scope, Scope::Workspace);
+
+        // Children report their display path and a parent pointer.
+        let child = list(&guard, "\\beta", &limits()).expect("list child");
+        assert_eq!(child.path, "\\beta");
+        assert_eq!(child.parent.as_deref(), Some("\\"));
+    }
+
+    #[test]
+    fn list_truncates_at_the_entry_limit() {
+        let (dir, guard) = workspace();
+        for name in ["a", "b", "c", "d"] {
+            put(&dir, &format!("{name}.txt"), b"x");
+        }
+        let response = list(&guard, "\\", &body(2)).expect("list root");
+        assert_eq!(response.entries.len(), 2);
+        assert!(response.truncated);
+        assert_eq!(response.total_entries, Some(4), "total counts all entries");
+    }
+
+    #[test]
+    fn list_rejects_a_file_and_a_missing_directory() {
+        let (dir, guard) = workspace();
+        put(&dir, "a.txt", b"a");
+        assert_code(list(&guard, "\\a.txt", &limits()), ErrorCode::BadRequest);
+        assert_code(list(&guard, "\\nope", &limits()), ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn stat_reports_size_and_volume_space() {
+        let (dir, guard) = workspace();
+        put(&dir, "a.txt", b"hello");
+
+        let response = stat(&guard, "\\a.txt").expect("stat file");
+        assert_eq!(response.entry.name, "a.txt");
+        assert_eq!(response.entry.path, "\\a.txt");
+        assert!(!response.entry.is_dir);
+        assert_eq!(response.entry.size, 5);
+        assert!(response.entry.error.is_none());
+        let total = response.volume_total_bytes.expect("volume total");
+        let free = response.volume_free_bytes.expect("volume free");
+        assert!(total > 0 && free <= total);
+
+        let directory = stat(&guard, "\\").expect("stat root");
+        assert!(directory.entry.is_dir);
+        assert_code(stat(&guard, "\\missing"), ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn mkdir_honours_create_parents_and_allow_existing() {
+        let (_dir, guard) = workspace();
+        let request = |path: &str, parents: bool, existing: bool| MkdirRequest {
+            path: path.to_string(),
+            create_parents: parents,
+            allow_existing: existing,
+        };
+
+        assert_code(
+            mkdir(&guard, &request("\\a\\b", false, false)),
+            ErrorCode::NotFound,
+        );
+        let created = mkdir(&guard, &request("\\a\\b", true, false)).expect("mkdir -p");
+        assert!(created.is_dir);
+        assert_eq!(created.path, "\\a\\b");
+        assert_eq!(created.name, "b");
+
+        // Idempotent only when the caller asked for it.
+        assert_code(
+            mkdir(&guard, &request("\\a\\b", true, false)),
+            ErrorCode::Conflict,
+        );
+        let existing = mkdir(&guard, &request("\\a\\b", true, true)).expect("idempotent");
+        assert_eq!(existing.path, "\\a\\b");
+
+        // A file in the way is always a conflict.
+        write(&guard, "\\file.txt", b"x", false, true, &limits()).expect("write");
+        assert_code(
+            mkdir(&guard, &request("\\file.txt", true, true)),
+            ErrorCode::Conflict,
+        );
+    }
+
+    #[test]
+    fn delete_reports_per_path_failures() {
+        let (dir, guard) = workspace();
+        put(&dir, "a.txt", b"a");
+        put(&dir, "keep.txt", b"k");
+
+        let response = delete(
+            &guard,
+            &DeleteRequest {
+                paths: vec!["\\a.txt".into(), "\\missing.txt".into()],
+                recursive: false,
+                even_if_readonly: false,
+            },
+        )
+        .expect("delete batch");
+        assert_eq!(response.deleted, vec!["\\a.txt".to_string()]);
+        assert_eq!(response.failed.len(), 1);
+        assert_eq!(response.failed[0].path, "\\missing.txt");
+        assert_eq!(response.failed[0].code, ErrorCode::NotFound);
+        assert!(dir.path().join("keep.txt").exists());
+    }
+
+    #[test]
+    fn delete_requires_recursive_for_a_non_empty_directory() {
+        let (dir, guard) = workspace();
+        put(&dir, "tree\\a.txt", b"a");
+        put(&dir, "tree\\sub\\b.txt", b"b");
+
+        let response = delete(
+            &guard,
+            &DeleteRequest {
+                paths: vec!["\\tree".into()],
+                recursive: false,
+                even_if_readonly: false,
+            },
+        )
+        .expect("delete batch");
+        assert!(response.deleted.is_empty());
+        assert_eq!(response.failed.len(), 1);
+        assert_eq!(response.failed[0].code, ErrorCode::Conflict);
+        assert!(dir.path().join("tree\\a.txt").exists(), "nothing was removed");
+
+        delete(
+            &guard,
+            &DeleteRequest {
+                paths: vec!["\\tree".into()],
+                recursive: true,
+                even_if_readonly: false,
+            },
+        )
+        .expect("recursive delete");
+        assert!(!dir.path().join("tree").exists());
+    }
+
+    #[test]
+    fn delete_touches_readonly_only_when_allowed() {
+        let (dir, guard) = workspace();
+        let path = put(&dir, "ro.txt", b"x");
+        let mut permissions = fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&path, permissions).expect("set readonly");
+
+        let response = delete(
+            &guard,
+            &DeleteRequest {
+                paths: vec!["\\ro.txt".into()],
+                recursive: false,
+                even_if_readonly: false,
+            },
+        )
+        .expect("delete batch");
+        assert_eq!(response.failed.len(), 1);
+        assert_eq!(response.failed[0].code, ErrorCode::Forbidden);
+        assert!(path.exists());
+
+        delete(
+            &guard,
+            &DeleteRequest {
+                paths: vec!["\\ro.txt".into()],
+                recursive: false,
+                even_if_readonly: true,
+            },
+        )
+        .expect("delete readonly");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn delete_refuses_the_workspace_root() {
+        let (dir, guard) = workspace();
+        put(&dir, "a.txt", b"a");
+        let response = delete(
+            &guard,
+            &DeleteRequest {
+                paths: vec!["\\".into()],
+                recursive: true,
+                even_if_readonly: true,
+            },
+        )
+        .expect("delete batch");
+        assert_eq!(response.failed.len(), 1);
+        assert_eq!(response.failed[0].code, ErrorCode::PolicyDenied);
+        assert!(dir.path().exists());
+    }
+
+    #[test]
+    fn rename_moves_and_respects_overwrite() {
+        let (dir, guard) = workspace();
+        put(&dir, "a.txt", b"one");
+        put(&dir, "b.txt", b"two");
+
+        rename(
+            &guard,
+            &RenameRequest {
+                from: "\\a.txt".into(),
+                to: "\\c.txt".into(),
+                overwrite: false,
+            },
+        )
+        .expect("rename to fresh name");
+        assert!(!dir.path().join("a.txt").exists());
+        assert_eq!(fs::read(dir.path().join("c.txt")).expect("read"), b"one");
+
+        assert_code(
+            rename(
+                &guard,
+                &RenameRequest {
+                    from: "\\c.txt".into(),
+                    to: "\\b.txt".into(),
+                    overwrite: false,
+                },
+            ),
+            ErrorCode::Conflict,
+        );
+        rename(
+            &guard,
+            &RenameRequest {
+                from: "\\c.txt".into(),
+                to: "\\b.txt".into(),
+                overwrite: true,
+            },
+        )
+        .expect("rename over existing");
+        assert_eq!(fs::read(dir.path().join("b.txt")).expect("read"), b"one");
+
+        assert_code(
+            rename(
+                &guard,
+                &RenameRequest {
+                    from: "\\b.txt".into(),
+                    to: "\\nope\\b.txt".into(),
+                    overwrite: true,
+                },
+            ),
+            ErrorCode::NotFound,
+        );
+    }
+
+    #[test]
+    fn rename_refuses_to_nest_a_directory_in_itself() {
+        let (dir, guard) = workspace();
+        put(&dir, "tree\\a.txt", b"a");
+        assert_code(
+            rename(
+                &guard,
+                &RenameRequest {
+                    from: "\\tree".into(),
+                    to: "\\tree\\inner".into(),
+                    overwrite: false,
+                },
+            ),
+            ErrorCode::BadRequest,
+        );
+    }
+
+    #[test]
+    fn copy_file_hashes_and_respects_overwrite() {
+        let (dir, guard) = workspace();
+        put(&dir, "a.txt", b"hello");
+        put(&dir, "b.txt", b"old");
+
+        let first = copy(
+            &guard,
+            &CopyRequest {
+                from: "\\a.txt".into(),
+                to: "\\c.txt".into(),
+                overwrite: false,
+                recursive: false,
+            },
+        )
+        .expect("copy file");
+        assert_eq!(first.path, "\\c.txt");
+        assert_eq!(first.size, 5);
+        assert!(!first.overwritten);
+        assert_eq!(fs::read(dir.path().join("c.txt")).expect("read"), b"hello");
+        // sha256("hello")
+        assert_eq!(
+            first.sha256.as_deref(),
+            Some("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")
+        );
+
+        assert_code(
+            copy(
+                &guard,
+                &CopyRequest {
+                    from: "\\a.txt".into(),
+                    to: "\\b.txt".into(),
+                    overwrite: false,
+                    recursive: false,
+                },
+            ),
+            ErrorCode::Conflict,
+        );
+        let replaced = copy(
+            &guard,
+            &CopyRequest {
+                from: "\\a.txt".into(),
+                to: "\\b.txt".into(),
+                overwrite: true,
+                recursive: false,
+            },
+        )
+        .expect("copy over existing");
+        assert!(replaced.overwritten);
+        assert_eq!(fs::read(dir.path().join("b.txt")).expect("read"), b"hello");
+    }
+
+    #[test]
+    fn copy_directory_is_recursive_and_contained() {
+        let (dir, guard) = workspace();
+        put(&dir, "src\\one.txt", b"1");
+        put(&dir, "src\\two.txt", b"22");
+        put(&dir, "src\\nested\\three.txt", b"333");
+
+        assert_code(
+            copy(
+                &guard,
+                &CopyRequest {
+                    from: "\\src".into(),
+                    to: "\\dst".into(),
+                    overwrite: false,
+                    recursive: false,
+                },
+            ),
+            ErrorCode::BadRequest,
+        );
+
+        let result = copy(
+            &guard,
+            &CopyRequest {
+                from: "\\src".into(),
+                to: "\\dst".into(),
+                overwrite: false,
+                recursive: true,
+            },
+        )
+        .expect("copy tree");
+        assert_eq!(result.size, 6, "1 + 2 + 3 bytes");
+        assert!(result.sha256.is_none(), "a tree has no single digest");
+        assert_eq!(fs::read(dir.path().join("dst\\one.txt")).expect("read"), b"1");
+        assert_eq!(
+            fs::read(dir.path().join("dst\\nested\\three.txt")).expect("read"),
+            b"333"
+        );
+
+        // Copying over an existing tree without overwrite is a conflict.
+        assert_code(
+            copy(
+                &guard,
+                &CopyRequest {
+                    from: "\\src".into(),
+                    to: "\\dst".into(),
+                    overwrite: false,
+                    recursive: true,
+                },
+            ),
+            ErrorCode::Conflict,
+        );
+
+        // A tree cannot be copied into its own subtree.
+        assert_code(
+            copy(
+                &guard,
+                &CopyRequest {
+                    from: "\\src".into(),
+                    to: "\\src\\inner".into(),
+                    overwrite: false,
+                    recursive: true,
+                },
+            ),
+            ErrorCode::BadRequest,
+        );
+    }
+
+    #[test]
+    fn copy_enforces_byte_and_entry_caps() {
+        let (dir, guard) = workspace();
+        put(&dir, "big.bin", &vec![7u8; 64]);
+        put(&dir, "tree\\a", b"1");
+        put(&dir, "tree\\b", b"2");
+        put(&dir, "tree\\c", b"3");
+
+        let tight_bytes = CopyCaps {
+            max_bytes: 8,
+            max_entries: 100,
+        };
+        assert_code(
+            copy_with_caps(
+                &guard,
+                &CopyRequest {
+                    from: "\\big.bin".into(),
+                    to: "\\copy.bin".into(),
+                    overwrite: false,
+                    recursive: false,
+                },
+                tight_bytes,
+            ),
+            ErrorCode::PayloadTooLarge,
+        );
+
+        let tight_entries = CopyCaps {
+            max_bytes: 1024 * 1024,
+            max_entries: 2,
+        };
+        assert_code(
+            copy_with_caps(
+                &guard,
+                &CopyRequest {
+                    from: "\\tree".into(),
+                    to: "\\tree_copy".into(),
+                    overwrite: false,
+                    recursive: true,
+                },
+                tight_entries,
+            ),
+            ErrorCode::PayloadTooLarge,
+        );
+    }
+
+    #[test]
+    fn read_slices_bytes_and_flags_truncation() {
+        let (dir, guard) = workspace();
+        let content = b"hello\nworld\n";
+        put(&dir, "a.txt", content);
+
+        let whole = read(&guard, "\\a.txt", 0, None, &limits()).expect("read all");
+        assert_eq!(whole.path, "\\a.txt");
+        assert_eq!(whole.size, 12);
+        assert_eq!(whole.offset, 0);
+        assert_eq!(whole.returned, 12);
+        assert!(!whole.truncated);
+        assert!(!whole.partial_line);
+        assert_eq!(whole.content_b64, BASE64.encode(content));
+        assert_eq!(whole.text.as_deref(), Some("hello\nworld\n"));
+        assert_eq!(whole.encoding.as_deref(), Some("utf-8"));
+
+        let head = read(&guard, "\\a.txt", 0, Some(5), &limits()).expect("read head");
+        assert_eq!(head.returned, 5);
+        assert!(head.truncated);
+        assert!(head.partial_line, "the cut lands mid-line");
+        assert_eq!(head.content_b64, BASE64.encode(b"hello"));
+
+        let tail = read(&guard, "\\a.txt", 6, Some(5), &limits()).expect("read tail");
+        assert_eq!(tail.content_b64, BASE64.encode(b"world"));
+        assert!(tail.truncated);
+
+        let newline = read(&guard, "\\a.txt", 11, Some(1), &limits()).expect("read last byte");
+        assert_eq!(newline.content_b64, BASE64.encode(b"\n"));
+        assert!(!newline.truncated);
+        assert!(!newline.partial_line);
+
+        let empty = read(&guard, "\\a.txt", 12, None, &limits()).expect("read at eof");
+        assert_eq!(empty.returned, 0);
+        assert!(!empty.truncated);
+
+        // The limit wins over the requested length.
+        let capped = read(&guard, "\\a.txt", 0, None, &body(5)).expect("capped read");
+        assert_eq!(capped.returned, 5);
+        assert!(capped.truncated);
+
+        assert_code(
+            read(&guard, "\\a.txt", 13, None, &limits()),
+            ErrorCode::BadRequest,
+        );
+    }
+
+    #[test]
+    fn read_marks_binary_content_and_rejects_directories() {
+        let (dir, guard) = workspace();
+        let binary = [0u8, 1, 2, 0xff, 0xfe];
+        put(&dir, "blob.bin", &binary);
+        fs::create_dir(dir.path().join("sub")).expect("dir");
+
+        let response = read(&guard, "\\blob.bin", 0, None, &limits()).expect("read binary");
+        assert_eq!(response.content_b64, BASE64.encode(binary));
+        assert!(response.text.is_none());
+        assert!(response.encoding.is_none());
+
+        assert_code(read(&guard, "\\sub", 0, None, &limits()), ErrorCode::BadRequest);
+        assert_code(
+            read(&guard, "\\missing.txt", 0, None, &limits()),
+            ErrorCode::NotFound,
+        );
+    }
+
+    #[test]
+    fn write_is_atomic_and_hashes_the_content() {
+        let (dir, guard) = workspace();
+        let result = write(&guard, "\\new\\a.txt", b"hello", false, true, &limits())
+            .expect("write nested file");
+        assert_eq!(result.path, "\\new\\a.txt");
+        assert_eq!(result.size, 5);
+        assert!(!result.overwritten);
+        assert_eq!(
+            result.sha256.as_deref(),
+            Some("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")
+        );
+        assert_eq!(fs::read(dir.path().join("new\\a.txt")).expect("read"), b"hello");
+        assert!(
+            temp_files(&dir.path().join("new")).is_empty(),
+            "no staging file left"
+        );
+
+        assert_code(
+            write(&guard, "\\new\\a.txt", b"other", false, true, &limits()),
+            ErrorCode::Conflict,
+        );
+        let replaced = write(&guard, "\\new\\a.txt", b"other", true, true, &limits())
+            .expect("overwrite");
+        assert!(replaced.overwritten);
+        assert_eq!(
+            fs::read(dir.path().join("new\\a.txt")).expect("read"),
+            b"other"
+        );
+    }
+
+    #[test]
+    fn write_validates_parent_directory_and_size_limit() {
+        let (dir, guard) = workspace();
+        assert_code(
+            write(&guard, "\\a\\b.txt", b"x", false, false, &limits()),
+            ErrorCode::NotFound,
+        );
+        assert_code(
+            write(&guard, "\\", b"x", true, true, &limits()),
+            ErrorCode::BadRequest,
+        );
+        assert_code(
+            write(&guard, "\\big.txt", b"1234", false, true, &body(3)),
+            ErrorCode::PayloadTooLarge,
+        );
+        assert!(
+            temp_files(dir.path()).is_empty(),
+            "a rejected upload leaves no staging file"
+        );
+    }
+
+    #[test]
+    fn write_replaces_a_readonly_file_when_overwriting() {
+        let (dir, guard) = workspace();
+        let path = put(&dir, "ro.txt", b"old");
+        let mut permissions = fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&path, permissions).expect("set readonly");
+
+        write(&guard, "\\ro.txt", b"fresh", true, true, &limits()).expect("overwrite readonly");
+        assert_eq!(fs::read(&path).expect("read"), b"fresh");
+    }
+
+    /// Reader that produces a repeating pattern without ever being buffered.
+    struct PatternReader {
+        total: usize,
+        emitted: usize,
+        biggest_request: usize,
+    }
+
+    impl PatternReader {
+        fn new(total: usize) -> Self {
+            Self {
+                total,
+                emitted: 0,
+                biggest_request: 0,
+            }
+        }
+    }
+
+    impl Read for PatternReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            assert!(
+                buf.len() <= 1024 * 1024,
+                "fsops asked for a {} byte buffer; uploads must stream",
+                buf.len()
+            );
+            self.biggest_request = self.biggest_request.max(buf.len());
+            let remaining = self.total - self.emitted;
+            let count = remaining.min(buf.len());
+            for (offset, slot) in buf.iter_mut().take(count).enumerate() {
+                *slot = ((self.emitted + offset) % 251) as u8;
+            }
+            self.emitted += count;
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn write_stream_never_buffers_the_whole_body() {
+        let (dir, guard) = workspace();
+        const SIZE: usize = 3 * 1024 * 1024;
+        let mut reader = PatternReader::new(SIZE);
+        let result = write_stream(&guard, "\\big.bin", &mut reader, false, true, &limits())
+            .expect("stream upload");
+        assert_eq!(result.size as usize, SIZE);
+        assert_eq!(reader.emitted, SIZE);
+
+        // The digest must match an independent hash of the same pattern.
+        let mut hasher = Sha256::new();
+        let mut chunk = Vec::with_capacity(SIZE);
+        for index in 0..SIZE {
+            chunk.push((index % 251) as u8);
+        }
+        hasher.update(&chunk);
+        let expected = crate::crypto::hex_encode(&hasher.finalize());
+        assert_eq!(result.sha256.as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            fs::metadata(dir.path().join("big.bin")).expect("metadata").len() as usize,
+            SIZE
+        );
+        assert!(temp_files(dir.path()).is_empty(), "staging file was published");
+    }
+
+    #[test]
+    fn write_stream_aborts_past_the_upload_limit() {
+        let (dir, guard) = workspace();
+        const BUDGET: u64 = 1024 * 1024;
+        let mut reader = PatternReader::new(8 * 1024 * 1024);
+        let limits = FsLimits::new(1000, 1000, BUDGET);
+        let error = write_stream(&guard, "\\too_big.bin", &mut reader, false, true, &limits)
+            .expect_err("limit is enforced mid-stream");
+        assert_eq!(error.code(), ErrorCode::PayloadTooLarge);
+        assert!(
+            reader.emitted as u64 <= BUDGET + COPY_CHUNK as u64,
+            "read {} bytes before giving up",
+            reader.emitted
+        );
+        assert!(!dir.path().join("too_big.bin").exists());
+        assert!(temp_files(dir.path()).is_empty(), "staging file cleaned up");
+    }
+
+    #[test]
+    fn roots_describe_workspace_scope() {
+        let (_dir, guard) = workspace();
+        let roots = roots(&guard).expect("roots");
+        assert_eq!(roots.scope, Scope::Workspace);
+        assert_eq!(roots.workspace_root.as_deref(), Some("\\"));
+        assert!(roots.drives.is_empty(), "a jailed session cannot browse drives");
+        for quick in &roots.quick_paths {
+            assert!(guard.is_inside(&guard.resolve(&quick.path).expect("quick path resolves")));
+            assert!(quick.path.starts_with('\\'), "virtual path: {}", quick.path);
+        }
+    }
+
+    #[test]
+    fn roots_describe_full_scope() {
+        let guard = PathGuard::new(Scope::Full, None).expect("full guard");
+        let roots = roots(&guard).expect("roots");
+        assert_eq!(roots.scope, Scope::Full);
+        assert!(roots.workspace_root.is_none());
+        assert!(!roots.drives.is_empty(), "at least the system drive");
+        let system = roots
+            .drives
+            .iter()
+            .find(|drive| drive.path.to_uppercase().starts_with("C:"))
+            .expect("system drive present");
+        assert!(system.total_bytes > 0);
+        assert!(system.free_bytes <= system.total_bytes);
+        assert!(!roots.quick_paths.is_empty(), "known folders exist");
+    }
+
+    #[test]
+    fn open_for_read_returns_size_and_rejects_directories() {
+        let (dir, guard) = workspace();
+        put(&dir, "a.txt", b"12345");
+        fs::create_dir(dir.path().join("sub")).expect("dir");
+
+        let (real, file, size) = open_for_read(&guard, "\\a.txt").expect("open file");
+        assert_eq!(size, 5);
+        assert!(guard.is_inside(&real));
+        assert_eq!(file.metadata().expect("metadata").len(), 5);
+
+        assert_code(open_for_read(&guard, "\\sub"), ErrorCode::BadRequest);
+        assert_code(open_for_read(&guard, "\\nope"), ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn is_existing_dir_matches_the_filesystem() {
+        let (dir, guard) = workspace();
+        put(&dir, "a.txt", b"a");
+        fs::create_dir(dir.path().join("sub")).expect("dir");
+        assert!(is_existing_dir(&guard, "\\"));
+        assert!(is_existing_dir(&guard, "\\sub"));
+        assert!(!is_existing_dir(&guard, "\\a.txt"));
+        assert!(!is_existing_dir(&guard, "\\nope"));
+    }
+
+    #[test]
+    fn resolve_returns_absolute_paths_inside_the_jail() {
+        let (dir, guard) = workspace();
+        put(&dir, "a.txt", b"a");
+        let real = resolve(&guard, "\\a.txt").expect("resolve");
+        assert!(real.is_absolute());
+        assert!(guard.is_inside(&real));
+        assert_eq!(guard.display(&real), "\\a.txt");
     }
 }
