@@ -11,9 +11,15 @@
 //!   process runtime into the core layer would leak into every consumer.
 //! * Each child gets a dedicated reader thread per stream. Threads accumulate
 //!   raw bytes into a shared [`StreamState`] (bounded by the output cap) and,
-//!   when streaming, hand complete chunks back over a channel. The caller's
-//!   sink is invoked from the calling thread only, which keeps
-//!   `run_streaming` free of `Send`/`Sync` bounds on the `&mut dyn FnMut`.
+//!   when streaming, hand complete chunks back over a **bounded** channel: a
+//!   consumer that stops draining throttles the child through the full pipes
+//!   instead of growing the queue. The caller's sink is invoked from the calling
+//!   thread only, which keeps `run_streaming` free of `Send`/`Sync` bounds on
+//!   the `&mut dyn FnMut`.
+//! * A consumer that walks away — or accepts nothing for a full second — aborts
+//!   the run, kills the process tree and is reported as a cancellation, so a
+//!   disconnected operator cannot leave the exporter collecting data nobody
+//!   reads.
 //! * `effective_cwd` is always an absolute, canonical path that was resolved
 //!   through the [`PathGuard`] jail, so a caller may safely log it.
 //! * A *cancelled* run is reported as `timed_out = false` and `exit_code = -1`;
@@ -27,9 +33,11 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
+use tokio::sync::mpsc::{self as stream_mpsc, Receiver, Sender};
 
 use rt_protocol::{
     ExecRequest, ExecResult, ExecSummary, OutputEncoding, OutputStream, ShellAvailability,
@@ -48,6 +56,18 @@ const READ_CHUNK: usize = 8 * 1024;
 const STREAM_CHUNK: usize = 8 * 1024;
 /// Grace period granted to reader threads once the child is gone.
 const READER_GRACE: Duration = Duration::from_millis(500);
+/// Bounded depth of the streaming hand-off channel, in chunks.
+///
+/// Together with [`STREAM_CHUNK`] this caps the queue at roughly 2 MiB, so a
+/// consumer that stops draining can no longer make the exporter grow without
+/// bound (S-07): the readers block, the pipes fill and the child is throttled.
+const STREAM_CHANNEL_CAPACITY: usize = 256;
+/// Longest a reader waits to hand one chunk to the consumer. A consumer that
+/// cannot take a single chunk for this long while the queue is full is treated
+/// as gone and the run is aborted.
+const STREAM_SEND_TIMEOUT: Duration = Duration::from_millis(1000);
+/// Poll interval used while waiting for room in the bounded channel.
+const STREAM_SEND_POLL: Duration = Duration::from_millis(5);
 
 /// `CREATE_NO_WINDOW` — spawned helpers must not flash a console window.
 #[cfg(windows)]
@@ -213,6 +233,55 @@ impl StreamState {
 struct Chunk {
     stream: OutputStream,
     bytes: Vec<u8>,
+}
+
+/// Bounded hand-off channel between the pipe readers and the collector.
+type ChunkSender = Sender<Chunk>;
+/// Collecting end of the hand-off channel.
+type ChunkReceiver = Receiver<Chunk>;
+
+/// Hands one chunk to the consumer of a streaming run.
+///
+/// Returns `false` when the consumer is gone, which means the caller must tear
+/// the run down. Two cases collapse into that verdict:
+///
+/// * the receiver was dropped (the operator disconnected);
+/// * the bounded queue stayed full for [`STREAM_SEND_TIMEOUT`], i.e. the
+///   consumer is wedged and would otherwise pin the child and this thread
+///   forever.
+///
+/// `blocking_send` is the natural call here, but it parks the collector thread
+/// until the consumer drains and therefore cannot be bounded by a timeout — a
+/// wedged consumer would never be detected, which is exactly the leak this
+/// channel is meant to close. Polling `try_send` provides the same backpressure
+/// (a full queue blocks the reader, the pipe fills, the child throttles) while
+/// keeping the wait bounded.
+fn deliver(sender: &ChunkSender, chunk: Chunk) -> bool {
+    let deadline = Instant::now() + STREAM_SEND_TIMEOUT;
+    let mut chunk = chunk;
+    loop {
+        match sender.try_send(chunk) {
+            Ok(()) => return true,
+            Err(TrySendError::Closed(_)) => return false,
+            Err(TrySendError::Full(returned)) => {
+                chunk = returned;
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(STREAM_SEND_POLL);
+            }
+        }
+    }
+}
+
+/// Tears a run down because the consumer of the chunk stream went away.
+///
+/// Called from a reader thread, which holds no `Child` handle, so the tree is
+/// killed by PID: the child must not keep running (and writing) for a consumer
+/// that no longer exists.
+fn abandon_consumer(pid: u32, abandoned: &AtomicBool) {
+    abandoned.store(true, Ordering::SeqCst);
+    kill_tree_by_pid(pid);
 }
 
 /// Runs a request to completion, returning stdout/stderr as decoded strings.
@@ -563,6 +632,25 @@ fn silence_console(cmd: &mut Command) {
     }
 }
 
+/// Appends the shell command to the child command line.
+///
+/// `Command::arg` treats the command as one argv token: it wraps it in quotes
+/// and escapes the embedded ones with backslashes. Neither `cmd.exe` nor
+/// PowerShell understands that escaping, so `echo "a b"` would reach the shell
+/// as `\"a b\"` and fail. The command is shell syntax, not an argument, so it
+/// is appended verbatim to the raw command line.
+fn append_command(command: &mut Command, raw: &str) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.raw_arg(raw);
+    }
+    #[cfg(not(windows))]
+    {
+        command.arg(raw);
+    }
+}
+
 fn decode_base64(value: &str) -> Result<Vec<u8>> {
     use base64::Engine as _;
     let compact: String = value.chars().filter(|c| !c.is_whitespace()).collect();
@@ -575,14 +663,17 @@ fn decode_base64(value: &str) -> Result<Vec<u8>> {
 fn spawn_reader(
     mut pipe: impl Read + Send + 'static,
     state: Arc<StreamState>,
-    sender: Option<Sender<Chunk>>,
+    sender: Option<ChunkSender>,
     stream: OutputStream,
     cap: usize,
     done: Arc<AtomicUsize>,
+    pid: u32,
+    abandoned: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut pending: Vec<u8> = Vec::new();
         let mut buf = vec![0u8; READ_CHUNK];
+        let mut consumer_gone = false;
 
         loop {
             let read = match pipe.read(&mut buf) {
@@ -599,17 +690,29 @@ fn spawn_reader(
 
             if let Some(sender) = &sender {
                 pending.extend_from_slice(&buf[..read]);
-                flush_complete(&mut pending, sender, stream);
+                if !flush_complete(&mut pending, sender, &stream) {
+                    // The consumer went away: stop collecting immediately and
+                    // take the child down so nothing keeps writing into a pipe
+                    // that no longer has a reader.
+                    abandon_consumer(pid, &abandoned);
+                    consumer_gone = true;
+                    break;
+                }
             }
         }
 
         // Flush the tail of the last (unterminated) line.
-        if let Some(sender) = &sender {
-            if !pending.is_empty() {
-                let _ = sender.send(Chunk {
-                    stream,
-                    bytes: std::mem::take(&mut pending),
-                });
+        if !consumer_gone {
+            if let Some(sender) = &sender {
+                if !pending.is_empty() {
+                    let tail = Chunk {
+                        stream,
+                        bytes: std::mem::take(&mut pending),
+                    };
+                    if !deliver(sender, tail) {
+                        abandon_consumer(pid, &abandoned);
+                    }
+                }
             }
         }
 
@@ -622,8 +725,8 @@ fn spawn_reader(
 ///
 /// A writer that ends a chunk in the middle of a character (common with CP936
 /// or any multi-byte encoding) leaves those trailing bytes in `pending` until
-/// the next read.
-fn flush_complete(pending: &mut Vec<u8>, sender: &Sender<Chunk>, stream: OutputStream) {
+/// the next read. Returns `false` as soon as the consumer refuses a chunk.
+fn flush_complete(pending: &mut Vec<u8>, sender: &ChunkSender, stream: &OutputStream) -> bool {
     loop {
         let cut = match pending.iter().rposition(|byte| *byte == b'\n') {
             Some(last_newline) => last_newline + 1,
@@ -631,13 +734,16 @@ fn flush_complete(pending: &mut Vec<u8>, sender: &Sender<Chunk>, stream: OutputS
             None => 0,
         };
         if cut == 0 {
-            return;
+            return true;
         }
         let bytes: Vec<u8> = pending.drain(..cut).collect();
-        let _ = sender.send(Chunk {
-            stream: stream.clone(),
+        let chunk = Chunk {
+            stream: (*stream).clone(),
             bytes,
-        });
+        };
+        if !deliver(sender, chunk) {
+            return false;
+        }
     }
 }
 
@@ -666,25 +772,54 @@ fn forward_chunk(chunk: Chunk, encoding: OutputEncoding, sink: &mut dyn FnMut(Ex
     }
 }
 
+/// Forwards everything currently queued, then reports whether producers survive.
+///
+/// Returns `false` once the channel is disconnected, i.e. both readers finished
+/// and the queue is empty.
+fn drain_chunks(
+    rx: &mut ChunkReceiver,
+    encoding: OutputEncoding,
+    sink: &mut dyn FnMut(ExecEvent),
+) -> bool {
+    loop {
+        match rx.try_recv() {
+            Ok(chunk) => forward_chunk(chunk, encoding, sink),
+            Err(TryRecvError::Empty) => return true,
+            Err(TryRecvError::Disconnected) => return false,
+        }
+    }
+}
+
 /// Kills the child and, on Windows, its whole process tree.
 fn kill_tree(child: &mut std::process::Child, pid: u32) {
     let _ = child.kill();
-
-    #[cfg(windows)]
-    {
-        // `child.kill()` only reaches the direct child; cmd.exe / powershell.exe
-        // usually have grandchildren that would keep running (and keep the pipe
-        // open). `taskkill /T` is the portable way to take the tree down.
-        let mut cmd = Command::new("taskkill");
-        cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        silence_console(&mut cmd);
-        let _ = cmd.status();
-    }
-
+    // `child.kill()` only reaches the direct child; cmd.exe / powershell.exe
+    // usually have grandchildren that would keep running (and keep the pipe
+    // open). `taskkill /T` is the portable way to take the tree down.
+    kill_tree_by_pid(pid);
     let _ = child.wait();
+}
+
+/// Kills a process tree using nothing but its PID.
+///
+/// Reader threads have no `Child` handle, so the tree is taken down through
+/// `taskkill`; the collector's own [`kill_tree`] path stays unchanged.
+#[cfg(windows)]
+fn kill_tree_by_pid(pid: u32) {
+    let mut cmd = Command::new("taskkill");
+    cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    silence_console(&mut cmd);
+    let _ = cmd.status();
+}
+
+/// Killing by PID is Windows-only; elsewhere the collector kills the child
+/// through its handle after noticing the abandoned flag.
+#[cfg(not(windows))]
+fn kill_tree_by_pid(pid: u32) {
+    let _ = pid;
 }
 
 /// Shared execution pipeline for `run`, `run_streaming` and `run_summary`.
@@ -723,7 +858,6 @@ fn execute(
     let mut command = Command::new(&plan.program);
     command
         .args(&plan.args)
-        .arg(&req.command)
         .current_dir(&cwd)
         .stdin(if stdin_bytes.is_some() {
             Stdio::piped()
@@ -732,6 +866,7 @@ fn execute(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    append_command(&mut command, &req.command);
     for (key, value) in &req.env {
         command.env(key, value);
     }
@@ -762,12 +897,16 @@ fn execute(
     let out_state = Arc::new(StreamState::new());
     let err_state = Arc::new(StreamState::new());
 
-    let (tx, rx): (Sender<Chunk>, Receiver<Chunk>) = mpsc::channel();
+    let (tx, mut rx): (ChunkSender, ChunkReceiver) = stream_mpsc::channel(STREAM_CHANNEL_CAPACITY);
     let reader_channel = if mode.emits_output() {
         Some(tx.clone())
     } else {
         None
     };
+
+    // `abandoned` is raised by a reader thread when the consumer of the chunk
+    // stream goes away; the run is then reported exactly like a cancellation.
+    let abandoned = Arc::new(AtomicBool::new(false));
 
     // `done` counts reader threads that reached EOF, so the caller can wait for
     // the pipes to drain without blocking forever on a stuck grandchild.
@@ -781,6 +920,8 @@ fn execute(
             OutputStream::Stdout,
             cap,
             Arc::clone(&done),
+            pid,
+            Arc::clone(&abandoned),
         );
         readers += 1;
     }
@@ -792,6 +933,8 @@ fn execute(
             OutputStream::Stderr,
             cap,
             Arc::clone(&done),
+            pid,
+            Arc::clone(&abandoned),
         );
         readers += 1;
     }
@@ -805,14 +948,11 @@ fn execute(
     let mut channel_open = mode.emits_output();
 
     loop {
+        // Forward whatever the readers managed to hand over. A full queue means
+        // the consumer is the bottleneck; the readers then block, the pipes fill
+        // and the child is throttled — no unbounded buffering anywhere.
         if channel_open {
-            match rx.recv_timeout(TICK) {
-                Ok(chunk) => forward_chunk(chunk, req.encoding, sink),
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => channel_open = false,
-            }
-        } else {
-            std::thread::sleep(TICK);
+            channel_open = drain_chunks(&mut rx, req.encoding, sink);
         }
 
         match child.try_wait() {
@@ -831,10 +971,18 @@ fn execute(
             cancelled = true;
             break;
         }
+        // The consumer went away (or wedged): the reader already killed the
+        // tree, so stop collecting and report the run as cancelled.
+        if abandoned.load(Ordering::SeqCst) {
+            cancelled = true;
+            break;
+        }
         if Instant::now() >= deadline {
             timed_out = true;
             break;
         }
+
+        std::thread::sleep(TICK);
     }
 
     if status.is_none() {
@@ -842,24 +990,32 @@ fn execute(
         status = child.try_wait().ok().flatten();
     }
 
+    // A reader may have killed the tree while the child was exiting, so the
+    // abandonment verdict has to survive the `try_wait` race above.
+    if abandoned.load(Ordering::SeqCst) {
+        cancelled = true;
+    }
+
     // Drain what the readers produced, bounded by `READER_GRACE`. In buffered
     // mode only the EOF counter matters, because no chunks are being sent.
     let drain_deadline = Instant::now() + READER_GRACE;
     if mode.emits_output() {
         loop {
-            let remaining = drain_deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            if !drain_chunks(&mut rx, req.encoding, sink) {
+                // Both readers are done and the queue was just emptied.
                 break;
             }
-            match rx.recv_timeout(remaining.min(TICK)) {
-                Ok(chunk) => forward_chunk(chunk, req.encoding, sink),
-                Err(RecvTimeoutError::Timeout) => {
-                    if done.load(Ordering::SeqCst) >= readers {
-                        break;
-                    }
-                }
-                Err(RecvTimeoutError::Disconnected) => break,
+            if done.load(Ordering::SeqCst) >= readers {
+                // No producer can add anything after its counter increment, but
+                // a chunk may still have landed between the sweep above and this
+                // read: one final sweep picks it up.
+                let _ = drain_chunks(&mut rx, req.encoding, sink);
+                break;
             }
+            if Instant::now() >= drain_deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
     } else {
         while done.load(Ordering::SeqCst) < readers && Instant::now() < drain_deadline {
@@ -1055,7 +1211,9 @@ mod tests {
         if !have_powershell() {
             return;
         }
-        let mut req = ExecRequest::new(ShellKind::Powershell, "Start-Sleep -Seconds 5");
+        // The child sleeps far longer than the timeout: without the kill this
+        // test would take 20s, so an early return proves the tree went down.
+        let mut req = ExecRequest::new(ShellKind::Powershell, "Start-Sleep -Seconds 20");
         req.timeout_ms = Some(400);
 
         let started = Instant::now();
@@ -1065,7 +1223,7 @@ mod tests {
         assert!(result.timed_out, "request should have timed out");
         assert_eq!(result.exit_code, -1);
         assert!(
-            elapsed < Duration::from_secs(4),
+            elapsed < Duration::from_secs(15),
             "timeout must kill the child early, took {elapsed:?}"
         );
     }
@@ -1075,7 +1233,7 @@ mod tests {
         if !have_powershell() {
             return;
         }
-        let mut req = ExecRequest::new(ShellKind::Powershell, "Start-Sleep -Seconds 5");
+        let mut req = ExecRequest::new(ShellKind::Powershell, "Start-Sleep -Seconds 20");
         req.timeout_ms = Some(30_000);
 
         let control = ExecControl::new();
@@ -1092,7 +1250,10 @@ mod tests {
 
         assert_eq!(summary.cancelled, Some(true));
         assert!(!summary.timed_out, "cancellation is not a timeout");
-        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "cancellation must stop the run long before the 30s timeout"
+        );
     }
 
     #[test]
@@ -1149,10 +1310,17 @@ mod tests {
 
     #[test]
     fn output_cap_truncates_but_keeps_reading() {
-        let req = ExecRequest::new(
-            ShellKind::Cmd,
-            "for /L %i in (1,1,3000) do @echo 0123456789",
-        );
+        // A payload much larger than the cap: the child keeps writing while the
+        // parent stops accumulating. If the reader stopped draining the pipe the
+        // child would block and the run would time out instead of exiting 0.
+        let temp = TempRoot::new("cap");
+        let path = temp.path().join("output.txt");
+        let payload: String = (0..20_000u32)
+            .map(|index| format!("line-{index}\r\n"))
+            .collect();
+        std::fs::write(&path, payload.as_bytes()).expect("write cap payload");
+
+        let req = ExecRequest::new(ShellKind::Cmd, format!("type \"{}\"", plain_path(&path)));
         let tight = ExecLimits {
             default_timeout: Duration::from_secs(30),
             max_timeout: Duration::from_secs(60),
@@ -1282,5 +1450,197 @@ mod tests {
         let result = run(&guard(), &req, &limits()).expect("run");
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout.trim(), "hello-env");
+    }
+
+    /// Polls a child until it exits, returning whether it did within `timeout`.
+    fn wait_for_exit(child: &mut std::process::Child, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) => {}
+                Err(_) => return false,
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Writes a large newline-delimited file and returns the temp root (kept
+    /// alive by the caller) plus a `cmd` command that streams it fast.
+    ///
+    /// A file bigger than the bounded queue is what makes the backpressure and
+    /// abandonment paths deterministic: `type` fills the pipes far quicker than
+    /// an interpreted `for` loop can.
+    fn big_output_file(tag: &str, lines: u32) -> (TempRoot, String, PathBuf) {
+        let temp = TempRoot::new(tag);
+        let path = temp.path().join("big.txt");
+        let mut content = String::with_capacity(lines as usize * 13);
+        for index in 0..lines {
+            content.push_str("line-");
+            content.push_str(&index.to_string());
+            content.push_str("\r\n");
+        }
+        std::fs::write(&path, content.as_bytes()).expect("write big output file");
+        let command = format!("type \"{}\"", plain_path(&path));
+        (temp, command, path)
+    }
+
+    /// A consumer that drops the chunk stream must stop the reader and take the
+    /// child down: this is the S-07 leak (unbounded growth when nobody reads).
+    #[test]
+    fn dropped_consumer_stops_the_reader_and_kills_the_child() {
+        use std::os::windows::process::CommandExt;
+
+        let (_temp, command, file) = big_output_file("drop", 300_000);
+
+        let mut cmd = Command::new(util::which("cmd.exe").expect("cmd.exe"));
+        cmd.arg("/C")
+            .raw_arg(&command)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        silence_console(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn chatty child");
+        let pid = child.id();
+        let pipe = child.stdout.take().expect("piped stdout");
+
+        let state = Arc::new(StreamState::new());
+        let done = Arc::new(AtomicUsize::new(0));
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = stream_mpsc::channel::<Chunk>(STREAM_CHANNEL_CAPACITY);
+
+        let reader = spawn_reader(
+            pipe,
+            Arc::clone(&state),
+            Some(tx),
+            OutputStream::Stdout,
+            1024 * 1024,
+            Arc::clone(&done),
+            pid,
+            Arc::clone(&abandoned),
+        );
+
+        for _ in 0..3 {
+            let chunk = match rx.blocking_recv() {
+                Some(chunk) => chunk,
+                None => panic!(
+                    "channel closed early: cmd={command:?} file_len={} status={:?} done={} raw={}",
+                    std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0),
+                    child.try_wait(),
+                    done.load(Ordering::SeqCst),
+                    state.raw_bytes.load(Ordering::SeqCst),
+                ),
+            };
+            assert!(matches!(chunk.stream, OutputStream::Stdout));
+            assert!(!chunk.bytes.is_empty());
+        }
+        drop(rx);
+
+        // The reader notices the disconnect, kills the tree and returns; the
+        // watchdog makes the "must not hang" requirement part of the assertion.
+        let (report_tx, report_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = reader.join();
+            let _ = report_tx.send(());
+        });
+        assert!(
+            report_rx.recv_timeout(Duration::from_secs(15)).is_ok(),
+            "the reader must stop once the consumer went away"
+        );
+        assert!(
+            abandoned.load(Ordering::SeqCst),
+            "consumer abandonment must be recorded"
+        );
+        assert!(
+            wait_for_exit(&mut child, Duration::from_secs(15)),
+            "the child tree must be killed when nobody reads its output"
+        );
+        assert_eq!(done.load(Ordering::SeqCst), 1, "reader must finish once");
+    }
+
+    /// Backpressure must not corrupt the stream: the consumer still sees every
+    /// line, in order, exactly once.
+    #[test]
+    fn streaming_preserves_the_complete_line_sequence() {
+        let req = ExecRequest::new(ShellKind::Cmd, "for /L %i in (1,1,40) do @echo seq-%i");
+
+        let mut events: Vec<ExecEvent> = Vec::new();
+        let result = {
+            let mut sink = |event: ExecEvent| events.push(event);
+            run_streaming(
+                &guard(),
+                &req,
+                &limits(),
+                ExecControl::new(),
+                &mut sink,
+            )
+        }
+        .expect("run_streaming");
+        assert_eq!(result.exit_code, 0);
+
+        let chunks: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                ExecEvent::Output(OutputStream::Stdout, text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(!chunks.is_empty(), "expected stdout chunks");
+
+        // Only the final chunk may be a partial line.
+        for chunk in chunks.iter().take(chunks.len() - 1) {
+            assert!(
+                chunk.ends_with('\n'),
+                "a non-final chunk must end on a line boundary: {chunk:?}"
+            );
+        }
+
+        let joined = chunks.concat();
+        let lines: Vec<&str> = joined.lines().collect();
+        assert_eq!(lines.len(), 40, "all lines must arrive exactly once");
+        for (index, line) in lines.iter().enumerate() {
+            assert_eq!(line.trim_end(), format!("seq-{}", index + 1));
+        }
+    }
+
+    /// A consumer that stalls (here: sleeps inside the sink) must be treated as
+    /// gone, not allowed to pin the run until the timeout expires.
+    #[test]
+    fn stalled_consumer_aborts_the_run_and_reports_cancelled() {
+        let (_temp, command, _file) = big_output_file("stall", 300_000);
+        let req = ExecRequest::new(ShellKind::Cmd, command);
+
+        let mut stalled = false;
+        let started = Instant::now();
+        let summary = {
+            let mut sink = |event: ExecEvent| {
+                // Wedge on the first *output* event: the reader threads are
+                // running by then, so the queue really backs up.
+                if !stalled {
+                    if let ExecEvent::Output(_, _) = event {
+                        stalled = true;
+                        std::thread::sleep(Duration::from_millis(1500));
+                    }
+                }
+            };
+            run_summary(&guard(), &req, &limits(), ExecControl::new(), &mut sink)
+        }
+        .expect("run_summary");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            summary.cancelled,
+            Some(true),
+            "a wedged consumer is reported as a cancelled run"
+        );
+        assert!(!summary.timed_out, "this must not look like a timeout");
+        assert_eq!(summary.exit_code, -1);
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "the run must abort early instead of honouring the 30s timeout, took {elapsed:?}"
+        );
     }
 }
