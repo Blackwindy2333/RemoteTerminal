@@ -189,7 +189,8 @@ impl AppState {
     }
 
     /// Currently valid sessions, newest expiry last.
-    pub fn sessions(&self) -> Vec<SessionInfo> {        self.sessions.list()
+    pub fn sessions(&self) -> Vec<SessionInfo> {
+        self.sessions.list()
     }
 
     /// Invalidates one session token; `false` when it was unknown or expired.
