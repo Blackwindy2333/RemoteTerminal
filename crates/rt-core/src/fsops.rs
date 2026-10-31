@@ -21,10 +21,13 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
+
 use rt_protocol::{
     CopyRequest, DeleteRequest, DeleteResult, FsDrive, FsEntry, FsOpFailure, FsRoots,
-    ListDirResponse, MkdirRequest, QuickPath, ReadFileResult, RenameRequest, StatResponse,
-    WriteResult,
+    ListDirResponse, MkdirRequest, OutputEncoding, QuickPath, ReadFileResult, RenameRequest,
+    StatResponse, WriteResult,
 };
 use sha2::{Digest, Sha256};
 
@@ -58,10 +61,6 @@ impl FsLimits {
             max_upload_bytes,
         }
     }
-}
-
-fn todo<T>(what: &str) -> Result<T> {
-    Err(RtError::NotImplemented(format!("fsops::{what}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -805,42 +804,197 @@ fn copy_dir_tree(
 }
 
 // ---------------------------------------------------------------------------
-// Transfer (see later sections)
+// Transfer
 // ---------------------------------------------------------------------------
 
-/// Reads a byte range and returns it both base64-encoded and, when printable,
-/// as text. `length == None` means "up to the limit".
+/// Reads a byte range and returns it base64-encoded plus decoded text.
+///
+/// `length == None` means "as much as the limit allows"; the result is always
+/// capped by `limits.max_read_bytes`.
 pub fn read(
-    _guard: &PathGuard,
-    _path: &str,
-    _offset: u64,
-    _length: Option<u64>,
-    _limits: &FsLimits,
+    guard: &PathGuard,
+    path: &str,
+    offset: u64,
+    length: Option<u64>,
+    limits: &FsLimits,
 ) -> Result<ReadFileResult> {
-    todo("read")
+    let real = guard.resolve(path)?;
+    let io_real = io_path(&real);
+    let meta = std::fs::metadata(&io_real).map_err(|e| io_err(&real, e))?;
+    if meta.is_dir() {
+        return Err(RtError::BadRequest(format!(
+            "`{}` is a directory",
+            guard.display(&real)
+        )));
+    }
+    let size = meta.len();
+    if offset > size {
+        return Err(RtError::BadRequest(format!(
+            "offset {offset} is past the end of `{}` ({size} bytes)",
+            guard.display(&real)
+        )));
+    }
+    let budget = limits.max_read_bytes;
+    let wanted = length.unwrap_or(budget).min(budget).min(size - offset);
+    let bytes = if wanted == 0 {
+        Vec::new()
+    } else {
+        util::read_file_range(&io_real, offset, wanted)?
+    };
+    // The file may have shrunk between the stat and the read.
+    let returned = bytes.len() as u64;
+    let truncated = offset + returned < size;
+    // A cut that does not end on a line boundary leaves a dangling last line.
+    let partial_line = truncated && bytes.last().is_some_and(|byte| *byte != b'\n');
+    let (text, encoding) = if util::looks_binary(&bytes) {
+        (None, None)
+    } else {
+        let (text, encoding) = util::decode_output(&bytes, OutputEncoding::Auto);
+        (Some(text), Some(encoding))
+    };
+    Ok(ReadFileResult {
+        path: guard.display(&real),
+        size,
+        offset,
+        returned,
+        truncated,
+        content_b64: BASE64.encode(&bytes),
+        text,
+        encoding,
+        partial_line,
+    })
 }
 
 pub fn write(
-    _guard: &PathGuard,
-    _path: &str,
-    _data: &[u8],
-    _overwrite: bool,
-    _create_parents: bool,
-    _limits: &FsLimits,
+    guard: &PathGuard,
+    path: &str,
+    data: &[u8],
+    overwrite: bool,
+    create_parents: bool,
+    limits: &FsLimits,
 ) -> Result<WriteResult> {
-    todo("write")
+    // A `&[u8]` is already a reader, so validation lives in one place only.
+    write_stream(guard, path, data, overwrite, create_parents, limits)
 }
 
 /// Streaming upload: never buffers the whole body, enforces `max_upload_bytes`.
+///
+/// The body goes to a sibling temp file first (`sync_all`) and is then renamed
+/// into place, so a crash or a mid-transfer failure never leaves a half-written
+/// destination behind.
 pub fn write_stream<R: Read>(
-    _guard: &PathGuard,
-    _path: &str,
-    _reader: R,
-    _overwrite: bool,
-    _create_parents: bool,
-    _limits: &FsLimits,
+    guard: &PathGuard,
+    path: &str,
+    mut reader: R,
+    overwrite: bool,
+    create_parents: bool,
+    limits: &FsLimits,
 ) -> Result<WriteResult> {
-    todo("write_stream")
+    let started = Instant::now();
+    let real = guard.resolve(path)?;
+    let io_real = io_path(&real);
+    let shown = guard.display(&real);
+
+    match std::fs::symlink_metadata(&io_real) {
+        Ok(meta) if meta.is_dir() => {
+            return Err(RtError::BadRequest(format!("`{shown}` is a directory")))
+        }
+        Ok(_) => {
+            if !overwrite {
+                return Err(RtError::Conflict(format!(
+                    "`{shown}` already exists (set overwrite=true)"
+                )));
+            }
+        }
+        Err(_) => {}
+    }
+    let overwritten = std::fs::symlink_metadata(&io_real).is_ok();
+
+    if let Some(parent) = real.parent() {
+        if create_parents {
+            std::fs::create_dir_all(io_path(parent)).map_err(|e| io_err(parent, e))?;
+        } else if !io_path(parent).is_dir() {
+            return Err(RtError::NotFound(format!(
+                "parent directory of `{shown}` does not exist (set create_parents=true)"
+            )));
+        }
+    }
+
+    let tmp = temp_sibling(&real)?;
+    let staged = spill_to_temp(&tmp, &mut reader, limits.max_upload_bytes);
+    let (size, sha256) = match staged {
+        Ok(staged) => staged,
+        Err(err) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err);
+        }
+    };
+    if let Err(err) = publish(&tmp, &io_real, overwritten) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    Ok(WriteResult {
+        path: shown,
+        size,
+        sha256: Some(sha256),
+        overwritten,
+        duration_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
+/// Sibling temp path (same volume, so the final rename is atomic).
+fn temp_sibling(real: &Path) -> Result<PathBuf> {
+    let name = real
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .ok_or_else(|| RtError::BadRequest("cannot write to a filesystem root".into()))?;
+    let temp_name = format!(".{name}.rt-{}.tmp", crate::crypto::random_token(8));
+    Ok(match real.parent() {
+        Some(parent) => parent.join(temp_name),
+        None => PathBuf::from(temp_name),
+    })
+}
+
+/// Streams `reader` into a fresh temp file, hashing as it goes.
+fn spill_to_temp<R: Read>(tmp: &Path, reader: &mut R, limit: u64) -> Result<(u64, String)> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp)
+        .map_err(|e| io_err(tmp, e))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; COPY_CHUNK];
+    let mut total: u64 = 0;
+    loop {
+        let read = reader.read(&mut buf).map_err(|e| io_err(tmp, e))?;
+        if read == 0 {
+            break;
+        }
+        total += read as u64;
+        if total > limit {
+            // Check before writing, so the temp file never exceeds the limit.
+            return Err(RtError::PayloadTooLarge(format!(
+                "upload exceeds the {limit} byte limit"
+            )));
+        }
+        hasher.update(&buf[..read]);
+        file.write_all(&buf[..read]).map_err(|e| io_err(tmp, e))?;
+    }
+    file.sync_all().map_err(|e| io_err(tmp, e))?;
+    Ok((total, crate::crypto::hex_encode(&hasher.finalize())))
+}
+
+/// Moves the staged temp file onto the destination.
+fn publish(tmp: &Path, target: &Path, overwritten: bool) -> Result<()> {
+    if overwritten {
+        // `MoveFileEx` cannot replace a read-only file.
+        if let Ok(meta) = std::fs::symlink_metadata(target) {
+            if util::is_readonly(util::file_attributes(&meta)) {
+                util::clear_readonly(target)?;
+            }
+        }
+    }
+    std::fs::rename(tmp, target).map_err(|e| io_err(target, e))
 }
 
 /// Drive letters (full access) or the workspace root (jailed) plus quick paths.
