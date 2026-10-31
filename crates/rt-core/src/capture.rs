@@ -933,6 +933,53 @@ mod tests {
         );
     }
 
+    /// Pure encoder test: runs everywhere, desktop session or not.
+    ///
+    /// `encode` is the step between "we have pixels" and "we have a payload";
+    /// exercising it on a synthetic frame proves the PNG/JPEG/BMP contract
+    /// (magic bytes, decoded dimensions, quality knob) even when the GDI grab
+    /// itself is unavailable because the desktop is locked or disconnected.
+    #[test]
+    fn encode_handles_every_format() {
+        let image = RgbaImage::from_fn(64, 48, |x, y| Rgba([x as u8, y as u8, 0x40, 0xff]));
+
+        let png = encode(&image, ImageFormat::Png, None).expect("PNG encoding must succeed");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "missing PNG signature");
+        let decoded = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+            .expect("produced PNG must decode");
+        assert_eq!((decoded.width(), decoded.height()), (64, 48));
+
+        let bmp = encode(&image, ImageFormat::Bmp, None).expect("BMP encoding must succeed");
+        assert_eq!(&bmp[..2], b"BM", "missing BMP signature");
+        let decoded = image::load_from_memory_with_format(&bmp, image::ImageFormat::Bmp)
+            .expect("produced BMP must decode");
+        assert_eq!((decoded.width(), decoded.height()), (64, 48));
+
+        let low = encode(&image, ImageFormat::Jpeg, Some(30)).expect("JPEG encoding must succeed");
+        let high = encode(&image, ImageFormat::Jpeg, Some(95)).expect("JPEG encoding must succeed");
+        for jpeg in [&low, &high] {
+            assert_eq!(&jpeg[..2], b"\xff\xd8", "missing JPEG SOI marker");
+            assert_eq!(&jpeg[jpeg.len() - 2..], b"\xff\xd9", "missing JPEG EOI marker");
+            let decoded = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg)
+                .expect("produced JPEG must decode");
+            assert_eq!((decoded.width(), decoded.height()), (64, 48));
+        }
+        assert!(
+            low.len() < high.len(),
+            "quality=30 ({}) should be smaller than quality=95 ({})",
+            low.len(),
+            high.len()
+        );
+
+        // A degenerate frame must encode instead of panicking; the caller
+        // rejects empty captures before this point.
+        let empty = RgbaImage::new(0, 0);
+        assert!(
+            encode(&empty, ImageFormat::Png, None).is_err(),
+            "a zero-sized frame cannot be encoded and must surface an error"
+        );
+    }
+
     /// Pure geometry test: runs everywhere, desktop session or not.
     #[test]
     fn resize_respects_caps() {
