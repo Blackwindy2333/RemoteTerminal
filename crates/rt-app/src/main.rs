@@ -179,13 +179,15 @@ async fn serve(boot: rt_app::Bootstrapped) -> anyhow::Result<i32> {
         tracing::warn!(target: "config", "{warning}");
     }
 
-    let handle = rt_server::serve(rt_server::ServerOptions {
+    let state = rt_server::AppState::new(rt_server::ServerOptions {
         config: boot.config().clone(),
         paths: boot.paths.clone(),
         sink: boot.logging.sink.clone(),
         audit: boot.logging.audit.clone(),
     })
-    .await?;
+    .context("cannot build the server state")?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let handle = rt_server::serve(state, shutdown_rx).await?;
 
     println!("RemoteTerminal server listening");
     println!("  url        : {}", handle.url);
@@ -204,6 +206,7 @@ async fn serve(boot: rt_app::Bootstrapped) -> anyhow::Result<i32> {
         .context("cannot listen for Ctrl+C")?;
     tracing::info!("shutdown requested");
     handle.stop();
+    let _ = shutdown_tx.send(true);
     Ok(0)
 }
 
@@ -375,7 +378,7 @@ fn resolve_config_arg(config: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     match config {
         Some(path) => Ok(path),
         None => rt_core::config::resolve_config_path(None)
-            .ok_or_else(|| anyhow::anyhow!("cannot determine the configuration path")),
+            .map_err(|err| anyhow::anyhow!("cannot determine the configuration path: {err}")),
     }
 }
 
