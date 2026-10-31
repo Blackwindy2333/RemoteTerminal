@@ -32,6 +32,9 @@ pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// whether a feature exists before calling it (modular features stay honest).
 pub mod capabilities {
     pub const EXEC: &str = "exec";
+    /// Reserved: an interactive PTY channel is not implemented yet, so this is
+    /// deliberately *not* part of [`all`] — a server must never advertise a
+    /// capability it cannot serve.
     pub const EXEC_PTY: &str = "exec.pty";
     pub const FS: &str = "fs";
     pub const FS_STREAM: &str = "fs.stream";
@@ -43,7 +46,7 @@ pub mod capabilities {
 
     pub fn all() -> Vec<&'static str> {
         vec![
-            EXEC, EXEC_PTY, FS, FS_STREAM, SYSINFO, CAPTURE, CAPTURE_STREAM, WS, AUDIT,
+            EXEC, FS, FS_STREAM, SYSINFO, CAPTURE, CAPTURE_STREAM, WS, AUDIT,
         ]
     }
 }
