@@ -13,6 +13,7 @@ rt-core = { workspace = true }
 reqwest = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 futures-util = { workspace = true }
 rustls = { workspace = true }
 bytes = { workspace = true }
