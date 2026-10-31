@@ -17,13 +17,16 @@
 //! * mutations that need to be crash-safe write a sibling temporary file, sync
 //!   it and then rename it over the target.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use rt_protocol::{
-    CopyRequest, DeleteRequest, DeleteResult, FsEntry, FsRoots, ListDirResponse, MkdirRequest,
-    QuickPath, ReadFileResult, RenameRequest, StatResponse, WriteResult,
+    CopyRequest, DeleteRequest, DeleteResult, FsDrive, FsEntry, FsOpFailure, FsRoots,
+    ListDirResponse, MkdirRequest, QuickPath, ReadFileResult, RenameRequest, StatResponse,
+    WriteResult,
 };
+use sha2::{Digest, Sha256};
 
 use crate::error::{Result, RtError};
 use crate::pathscope::{self, PathGuard};
@@ -344,19 +347,461 @@ pub fn mkdir(guard: &PathGuard, req: &MkdirRequest) -> Result<FsEntry> {
 }
 
 // ---------------------------------------------------------------------------
-// Mutation (see later sections)
+// Mutation
 // ---------------------------------------------------------------------------
 
-pub fn delete(_guard: &PathGuard, _req: &DeleteRequest) -> Result<DeleteResult> {
-    todo("delete")
+/// Deletes a batch of paths, reporting per-path failures instead of aborting.
+///
+/// The jail root and volume roots are never deletable, links are removed
+/// without being entered (so they cannot smuggle the deletion outside the jail)
+/// and a non-empty directory requires `recursive=true`.
+pub fn delete(guard: &PathGuard, req: &DeleteRequest) -> Result<DeleteResult> {
+    let mut deleted = Vec::new();
+    let mut failed: Vec<FsOpFailure> = Vec::new();
+    if req.paths.is_empty() {
+        return Err(RtError::BadRequest("no paths given".into()));
+    }
+    for path in &req.paths {
+        match delete_one(guard, path, req.recursive, req.even_if_readonly) {
+            Ok(shown) => deleted.push(shown),
+            Err(err) => failed.push(FsOpFailure {
+                path: path.clone(),
+                code: err.code(),
+                message: err.to_string(),
+            }),
+        }
+    }
+    Ok(DeleteResult { deleted, failed })
 }
 
-pub fn rename(_guard: &PathGuard, _req: &RenameRequest) -> Result<()> {
-    todo("rename")
+fn delete_one(
+    guard: &PathGuard,
+    path: &str,
+    recursive: bool,
+    even_if_readonly: bool,
+) -> Result<String> {
+    let real = guard.resolve(path)?;
+    ensure_deletable(guard, &real)?;
+    let io_real = io_path(&real);
+    let meta = std::fs::symlink_metadata(&io_real).map_err(|e| io_err(&real, e))?;
+    let attrs = util::file_attributes(&meta);
+    let is_link = meta.file_type().is_symlink() || util::is_reparse_point(attrs);
+
+    if is_link {
+        if even_if_readonly {
+            let _ = util::clear_readonly(&io_real);
+        }
+        remove_link(&io_real).map_err(|e| io_err(&real, e))?;
+        return Ok(guard.display(&real));
+    }
+
+    if meta.is_dir() {
+        if !recursive {
+            // Check emptiness ourselves: Windows reports "not empty" as a
+            // generic error, which would surface as an opaque `internal_error`.
+            let empty = {
+                let mut reader = std::fs::read_dir(&io_real).map_err(|e| io_err(&real, e))?;
+                reader.next().is_none()
+            };
+            if !empty {
+                return Err(RtError::Conflict(format!(
+                    "directory `{}` is not empty (set recursive=true)",
+                    guard.display(&real)
+                )));
+            }
+        } else {
+            remove_children(&io_real, even_if_readonly)?;
+        }
+        if even_if_readonly {
+            util::clear_readonly(&io_real)?;
+        }
+        std::fs::remove_dir(&io_real).map_err(|e| io_err(&real, e))?;
+        return Ok(guard.display(&real));
+    }
+
+    if even_if_readonly {
+        util::clear_readonly(&io_real)?;
+    }
+    std::fs::remove_file(&io_real).map_err(|e| io_err(&real, e))?;
+    Ok(guard.display(&real))
 }
 
-pub fn copy(_guard: &PathGuard, _req: &CopyRequest) -> Result<WriteResult> {
-    todo("copy")
+/// Refuses deletions that would destroy the whole jail or a whole volume.
+fn ensure_deletable(guard: &PathGuard, real: &Path) -> Result<()> {
+    if let Some(root) = guard.root() {
+        if pathscope::path_eq(real, root) {
+            return Err(RtError::PolicyDenied(
+                "refusing to delete the workspace root".into(),
+            ));
+        }
+    }
+    if real.parent().is_none() {
+        return Err(RtError::PolicyDenied(format!(
+            "refusing to delete volume root `{}`",
+            guard.display(real)
+        )));
+    }
+    Ok(())
+}
+
+/// Removes a link / junction itself; never descends into it.
+fn remove_link(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(dir_err) => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(_) => Err(dir_err),
+        },
+    }
+}
+
+/// Recursively deletes the *contents* of `dir`, without following links.
+///
+/// Links are unlinked as-is (removing the link, not its target), which is what
+/// keeps a recursive delete from ever escaping the jail.
+fn remove_children(dir: &Path, clear_ro: bool) -> Result<()> {
+    let reader = std::fs::read_dir(dir).map_err(|e| io_err(dir, e))?;
+    // Snapshot first: the enumeration handle must be closed before removing.
+    let mut children: Vec<(PathBuf, std::fs::Metadata)> = Vec::new();
+    for item in reader {
+        let item = item.map_err(|e| io_err(dir, e))?;
+        let child = item.path();
+        let meta = std::fs::symlink_metadata(&child).map_err(|e| io_err(&child, e))?;
+        children.push((child, meta));
+    }
+    for (child, meta) in children {
+        let attrs = util::file_attributes(&meta);
+        if meta.file_type().is_symlink() || util::is_reparse_point(attrs) {
+            if clear_ro {
+                let _ = util::clear_readonly(&child);
+            }
+            remove_link(&child).map_err(|e| io_err(&child, e))?;
+        } else if meta.is_dir() {
+            remove_children(&child, clear_ro)?;
+            if clear_ro {
+                util::clear_readonly(&child)?;
+            }
+            std::fs::remove_dir(&child).map_err(|e| io_err(&child, e))?;
+        } else {
+            if clear_ro {
+                util::clear_readonly(&child)?;
+            }
+            std::fs::remove_file(&child).map_err(|e| io_err(&child, e))?;
+        }
+    }
+    Ok(())
+}
+
+pub fn rename(guard: &PathGuard, req: &RenameRequest) -> Result<()> {
+    let from = guard.resolve(&req.from)?;
+    let to = guard.resolve(&req.to)?;
+    if pathscope::path_eq(&from, &to) {
+        // Same file (a case-only rename is indistinguishable after
+        // canonicalisation); nothing to move.
+        return Ok(());
+    }
+    let io_from = io_path(&from);
+    let io_to = io_path(&to);
+    let from_meta = std::fs::symlink_metadata(&io_from).map_err(|e| io_err(&from, e))?;
+
+    if let Some(parent) = to.parent() {
+        if !io_path(parent).is_dir() {
+            return Err(RtError::NotFound(format!(
+                "parent directory of `{}` does not exist",
+                guard.display(&to)
+            )));
+        }
+    }
+    if from_meta.is_dir() && pathscope::path_starts_with(&to, &from) {
+        return Err(RtError::BadRequest(format!(
+            "cannot move `{}` into its own subtree (`{}`)",
+            guard.display(&from),
+            guard.display(&to)
+        )));
+    }
+
+    if let Ok(to_meta) = std::fs::symlink_metadata(&io_to) {
+        if !req.overwrite {
+            return Err(RtError::Conflict(format!(
+                "`{}` already exists (set overwrite=true)",
+                guard.display(&to)
+            )));
+        }
+        let to_attrs = util::file_attributes(&to_meta);
+        if to_meta.file_type().is_symlink() || util::is_reparse_point(to_attrs) {
+            remove_link(&io_to).map_err(|e| io_err(&to, e))?;
+        } else if to_meta.is_dir() {
+            // `MoveFileEx` replaces files but not directories, so the existing
+            // directory has to go first.
+            remove_children(&io_to, true)?;
+            std::fs::remove_dir(&io_to).map_err(|e| io_err(&to, e))?;
+        } else if util::is_readonly(to_attrs) {
+            util::clear_readonly(&io_to)?;
+        }
+    }
+
+    match std::fs::rename(&io_from, &io_to) {
+        Ok(()) => Ok(()),
+        // ERROR_NOT_SAME_DEVICE: a move is a copy+delete across volumes, which
+        // this endpoint does not silently perform.
+        Err(err) if err.raw_os_error() == Some(17) => Err(RtError::BadRequest(format!(
+            "`{}` and `{}` are on different volumes; use copy instead",
+            guard.display(&from),
+            guard.display(&to)
+        ))),
+        Err(err) => Err(io_err(&from, err)),
+    }
+}
+
+/// Ceiling for a single copy: one request must not be able to move a whole disk.
+const COPY_MAX_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Ceiling for the number of entries a single copy may create.
+const COPY_MAX_ENTRIES: u64 = 200_000;
+/// Chunk size for streamed file copies (and for uploads, see [`write_stream`]).
+const COPY_CHUNK: usize = 256 * 1024;
+
+/// Copy ceilings; a separate struct so tests can inject tiny limits.
+#[derive(Debug, Clone, Copy)]
+struct CopyCaps {
+    max_bytes: u64,
+    max_entries: u64,
+}
+
+impl Default for CopyCaps {
+    fn default() -> Self {
+        Self {
+            max_bytes: COPY_MAX_TOTAL_BYTES,
+            max_entries: COPY_MAX_ENTRIES,
+        }
+    }
+}
+
+struct CopyState {
+    bytes: u64,
+    entries: u64,
+    caps: CopyCaps,
+}
+
+impl CopyState {
+    fn count_entry(&mut self) -> Result<()> {
+        self.entries += 1;
+        if self.entries > self.caps.max_entries {
+            return Err(RtError::PayloadTooLarge(format!(
+                "copy would create more than {} entries",
+                self.caps.max_entries
+            )));
+        }
+        Ok(())
+    }
+}
+
+pub fn copy(guard: &PathGuard, req: &CopyRequest) -> Result<WriteResult> {
+    copy_with_caps(guard, req, CopyCaps::default())
+}
+
+fn copy_with_caps(guard: &PathGuard, req: &CopyRequest, caps: CopyCaps) -> Result<WriteResult> {
+    let started = Instant::now();
+    let from = guard.resolve(&req.from)?;
+    let to = guard.resolve(&req.to)?;
+    if pathscope::path_eq(&from, &to) {
+        return Err(RtError::BadRequest(format!(
+            "`{}` is both source and destination",
+            guard.display(&from)
+        )));
+    }
+    if pathscope::path_starts_with(&to, &from) {
+        return Err(RtError::BadRequest(format!(
+            "cannot copy `{}` into its own subtree (`{}`)",
+            guard.display(&from),
+            guard.display(&to)
+        )));
+    }
+    let io_from = io_path(&from);
+    let io_to = io_path(&to);
+    let from_meta = std::fs::symlink_metadata(&io_from).map_err(|e| io_err(&from, e))?;
+    let from_is_dir = from_meta.is_dir();
+    if let Some(parent) = to.parent() {
+        if !io_path(parent).is_dir() {
+            return Err(RtError::NotFound(format!(
+                "parent directory of `{}` does not exist",
+                guard.display(&to)
+            )));
+        }
+    }
+
+    let target_meta = std::fs::symlink_metadata(&io_to).ok();
+    let overwritten = target_meta.is_some();
+    let to_label = guard.display(&to);
+    let mut state = CopyState {
+        bytes: 0,
+        entries: 0,
+        caps,
+    };
+
+    if from_is_dir {
+        if !req.recursive {
+            return Err(RtError::BadRequest(format!(
+                "`{}` is a directory (set recursive=true)",
+                guard.display(&from)
+            )));
+        }
+        if let Some(meta) = &target_meta {
+            if !req.overwrite {
+                return Err(RtError::Conflict(format!(
+                    "`{to_label}` already exists (set overwrite=true)"
+                )));
+            }
+            if !meta.is_dir() {
+                return Err(RtError::Conflict(format!(
+                    "`{to_label}` exists and is not a directory"
+                )));
+            }
+        }
+        copy_dir_tree(&io_from, &io_to, &to_label, req.overwrite, &mut state)?;
+    } else {
+        if let Some(meta) = &target_meta {
+            if !req.overwrite {
+                return Err(RtError::Conflict(format!(
+                    "`{to_label}` already exists (set overwrite=true)"
+                )));
+            }
+            if meta.is_dir() {
+                return Err(RtError::Conflict(format!(
+                    "`{to_label}` is a directory"
+                )));
+            }
+        }
+        let mut hasher = Sha256::new();
+        copy_file(
+            &io_from,
+            &io_to,
+            &to_label,
+            req.overwrite,
+            &mut state,
+            Some(&mut hasher),
+        )?;
+        let digest = crate::crypto::hex_encode(&hasher.finalize());
+        return Ok(WriteResult {
+            path: to_label,
+            size: state.bytes,
+            sha256: Some(digest),
+            overwritten,
+            duration_ms: started.elapsed().as_millis() as u64,
+        });
+    }
+
+    Ok(WriteResult {
+        path: to_label,
+        size: state.bytes,
+        sha256: None,
+        overwritten,
+        duration_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
+/// Copies one file through a fixed-size buffer, optionally hashing as it goes.
+fn copy_file(
+    from: &Path,
+    to: &Path,
+    to_label: &str,
+    overwrite: bool,
+    state: &mut CopyState,
+    mut hasher: Option<&mut Sha256>,
+) -> Result<()> {
+    if let Ok(meta) = std::fs::symlink_metadata(to) {
+        if !overwrite {
+            return Err(RtError::Conflict(format!(
+                "`{to_label}` already exists (set overwrite=true)"
+            )));
+        }
+        if meta.is_dir() {
+            return Err(RtError::Conflict(format!(
+                "`{to_label}` is a directory"
+            )));
+        }
+        if util::is_readonly(util::file_attributes(&meta)) {
+            util::clear_readonly(to)?;
+        }
+    }
+    let mut source = std::fs::File::open(from).map_err(|e| io_err(from, e))?;
+    let mut target = std::fs::File::create(to).map_err(|e| io_err(to, e))?;
+    let mut buf = vec![0u8; COPY_CHUNK];
+    loop {
+        let read = source.read(&mut buf).map_err(|e| io_err(from, e))?;
+        if read == 0 {
+            break;
+        }
+        state.bytes += read as u64;
+        if state.bytes > state.caps.max_bytes {
+            return Err(RtError::PayloadTooLarge(format!(
+                "copy would move more than {} bytes in one request",
+                state.caps.max_bytes
+            )));
+        }
+        if let Some(hasher) = hasher.as_deref_mut() {
+            hasher.update(&buf[..read]);
+        }
+        target
+            .write_all(&buf[..read])
+            .map_err(|e| io_err(to, e))?;
+    }
+    target.sync_all().map_err(|e| io_err(to, e))?;
+    Ok(())
+}
+
+/// Recursively copies a directory tree (links are reported and skipped).
+fn copy_dir_tree(
+    from: &Path,
+    to: &Path,
+    to_label: &str,
+    overwrite: bool,
+    state: &mut CopyState,
+) -> Result<()> {
+    state.count_entry()?;
+    match std::fs::symlink_metadata(to) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            return Err(RtError::Conflict(format!(
+                "`{to_label}` exists and is not a directory"
+            )))
+        }
+        Err(_) => std::fs::create_dir(to).map_err(|e| io_err(to, e))?,
+    }
+
+    let reader = std::fs::read_dir(from).map_err(|e| io_err(from, e))?;
+    let mut children = Vec::new();
+    for item in reader {
+        let item = item.map_err(|e| io_err(from, e))?;
+        children.push(item.path());
+    }
+    for child in children {
+        let meta = std::fs::symlink_metadata(&child).map_err(|e| io_err(&child, e))?;
+        let attrs = util::file_attributes(&meta);
+        let name = child
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let target = to.join(&name);
+        let target_label = format!("{to_label}\\{name}");
+        if meta.file_type().is_symlink() || util::is_reparse_point(attrs) {
+            // Re-creating a link needs privileges, and following one could read
+            // outside the jail: report the skip instead of guessing.
+            tracing::warn!(
+                target: "fsops",
+                entry = %child.display(),
+                destination = %target_label,
+                "skipping reparse point / symlink during recursive copy"
+            );
+            continue;
+        }
+        if meta.is_dir() {
+            copy_dir_tree(&child, &target, &target_label, overwrite, state)?;
+        } else {
+            state.count_entry()?;
+            copy_file(&child, &target, &target_label, overwrite, state, None)?;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -410,7 +855,7 @@ pub fn roots(guard: &PathGuard) -> Result<FsRoots> {
         None => {
             let drives = util::disks()
                 .into_iter()
-                .map(|disk| rt_protocol::FsDrive {
+                .map(|disk| FsDrive {
                     label: if disk.name.is_empty() || disk.name == disk.mount_point {
                         None
                     } else {
