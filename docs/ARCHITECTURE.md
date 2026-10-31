@@ -56,6 +56,10 @@ rt-app       ← main.rs（CLI 分发）+ GUI + MCP 桥
 6. **上传/下载**：上传流式写临时文件再原子 rename，强制 `max_upload_bytes`；下载支持 Range，路径必须过 guard；不允许写 `config.toml`/证书私钥（guard 之外再加黑名单）。
 7. **审计**：所有写操作、登录、exec、截屏都写 `logs/audit.jsonl`（`AuditEvent`），同时镜像到 tracing。
 8. **默认最小暴露**：`server.enabled=false` 默认关闭；默认 `bind=0.0.0.0` 但必须 TLS + 有密码用户才能启用；启动日志打印指纹与监听地址。
+9. **作用域即能力边界**：`Scope::Workspace` 会话只能做文件读写与查询；**exec、截屏/窗口、日志读取要求 `Scope::Full`**（`require_full_scope`），workspace 令牌不得等于全盘 RCE。
+10. **控制文件黑名单**（`pathscope::protect_paths`，启动时安装一次）：无论作用域，`config.toml`/`config.toml.bak`/`data/instance.lock`/TLS 目录（含私钥）/`logs/audit.jsonl` 及其祖先目录全部拒绝 —— 否则 Full 会话可自行加用户、替换私钥或抹掉审计。
+11. **凭据只在已固定的证书上发送**：证书指纹未固定时（TOFU），客户端（CLI/MCP）只允许发一次**未认证**的 `health` 探针来获取指纹，随后报错要求把指纹写进配置或 `RT_FINGERPRINT`，**绝不在未固定连接上传输密码**。
+12. **`serve` 强制校验配置**：`rt-app` 的 `serve` 与 `rt_server::serve` 在绑定端口前调用 `Config::validate()`，有 error 即拒绝启动（防止 `tls=false` 静默明文上线）。
 
 ## 4. 配置文件
 
