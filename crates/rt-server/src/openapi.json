@@ -1,0 +1,1197 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "RemoteTerminal Server API",
+    "version": "0.1.0",
+    "description": "Remote control API for a Windows host: command execution, filesystem access, machine information, screen capture, log/audit tails and a WebSocket streaming channel.",
+    "license": { "name": "Proprietary" }
+  },
+  "servers": [{ "url": "/", "description": "This server" }],
+  "security": [{ "bearerAuth": [] }],
+  "tags": [
+    { "name": "system", "description": "Health, version and API description" },
+    { "name": "auth", "description": "Sessions, API keys and WebSocket tickets" },
+    { "name": "exec", "description": "Command execution" },
+    { "name": "fs", "description": "Filesystem browsing and transfer" },
+    { "name": "sysinfo", "description": "Machine information" },
+    { "name": "capture", "description": "Screen and window capture" },
+    { "name": "stream", "description": "WebSocket streaming" },
+    { "name": "diagnostics", "description": "Logs and audit trail" }
+  ],
+  "paths": {
+    "/healthz": {
+      "get": {
+        "tags": ["system"],
+        "summary": "Liveness probe",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Server is up",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["status", "version"],
+                  "properties": {
+                    "status": { "type": "string", "const": "ok" },
+                    "version": { "type": "string", "examples": ["0.1.0"] }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/info": {
+      "get": {
+        "tags": ["system"],
+        "summary": "Public server description (no secrets)",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Server information",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/ServerInfo" } }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/openapi.json": {
+      "get": {
+        "tags": ["system"],
+        "summary": "This document",
+        "security": [],
+        "responses": { "200": { "description": "OpenAPI 3.1 description" } }
+      }
+    },
+    "/api/v1/auth/login": {
+      "post": {
+        "tags": ["auth"],
+        "summary": "Exchange credentials for a session token",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/LoginRequest" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Session issued",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/LoginResponse" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "409": { "$ref": "#/components/responses/Locked" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
+        }
+      }
+    },
+    "/api/v1/auth/logout": {
+      "post": {
+        "tags": ["auth"],
+        "summary": "Revoke the calling session",
+        "responses": {
+          "200": {
+            "description": "Session revoked",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Ack" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/auth/me": {
+      "get": {
+        "tags": ["auth"],
+        "summary": "Describe the calling session",
+        "responses": {
+          "200": {
+            "description": "Session details",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/SessionInfo" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/auth/ws-ticket": {
+      "post": {
+        "tags": ["auth", "stream"],
+        "summary": "Mint a single-use WebSocket ticket (60 s)",
+        "responses": {
+          "200": {
+            "description": "Ticket issued",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/WsTicketResponse" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/exec/shells": {
+      "get": {
+        "tags": ["exec"],
+        "summary": "List available shells",
+        "responses": {
+          "200": {
+            "description": "Shells installed on this host",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/ShellListResponse" } }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/exec": {
+      "post": {
+        "tags": ["exec"],
+        "summary": "Run one command and wait for it",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/ExecRequest" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Command result",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/ExecResult" } }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "503": { "$ref": "#/components/responses/Unavailable" },
+          "504": { "$ref": "#/components/responses/Timeout" }
+        }
+      }
+    },
+    "/api/v1/fs/roots": {
+      "get": {
+        "tags": ["fs"],
+        "summary": "List browse roots (workspace or drives) and quick paths",
+        "responses": {
+          "200": {
+            "description": "Roots",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/FsRoots" } }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/fs/list": {
+      "get": {
+        "tags": ["fs"],
+        "summary": "List a directory",
+        "parameters": [{ "$ref": "#/components/parameters/PathQuery" }],
+        "responses": {
+          "200": {
+            "description": "Directory listing",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/ListDirResponse" } }
+            }
+          },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/v1/fs/stat": {
+      "get": {
+        "tags": ["fs"],
+        "summary": "Stat one entry",
+        "parameters": [{ "$ref": "#/components/parameters/PathQuery" }],
+        "responses": {
+          "200": {
+            "description": "Entry metadata",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/StatResponse" } }
+            }
+          },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/v1/fs/mkdir": {
+      "post": {
+        "tags": ["fs"],
+        "summary": "Create a directory",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/MkdirRequest" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Created entry",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/FsEntry" } }
+            }
+          },
+          "409": { "$ref": "#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/api/v1/fs/delete": {
+      "post": {
+        "tags": ["fs"],
+        "summary": "Delete files or directories",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/DeleteRequest" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Per-path outcome",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/DeleteResult" } }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/fs/rename": {
+      "post": {
+        "tags": ["fs"],
+        "summary": "Rename or move an entry",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/RenameRequest" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Renamed",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Ack" } }
+            }
+          },
+          "409": { "$ref": "#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/api/v1/fs/copy": {
+      "post": {
+        "tags": ["fs"],
+        "summary": "Copy a file or tree",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/CopyRequest" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Copy result",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/WriteResult" } }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/fs/read": {
+      "get": {
+        "tags": ["fs"],
+        "summary": "Read a byte range as base64 plus decoded text",
+        "parameters": [
+          { "$ref": "#/components/parameters/PathQuery" },
+          { "name": "offset", "in": "query", "schema": { "type": "integer", "minimum": 0 } },
+          { "name": "length", "in": "query", "schema": { "type": "integer", "minimum": 0 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "File slice",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/ReadFileResult" } }
+            }
+          },
+          "413": { "$ref": "#/components/responses/PayloadTooLarge" }
+        }
+      }
+    },
+    "/api/v1/fs/download": {
+      "get": {
+        "tags": ["fs"],
+        "summary": "Stream a file (supports Range)",
+        "parameters": [
+          { "$ref": "#/components/parameters/PathQuery" },
+          {
+            "name": "Range",
+            "in": "header",
+            "schema": { "type": "string", "examples": ["bytes=0-1023"] }
+          }
+        ],
+        "responses": {
+          "200": { "description": "Whole file" },
+          "206": { "description": "Requested range; carries Content-Range" },
+          "416": { "$ref": "#/components/responses/RangeNotSatisfiable" }
+        }
+      }
+    },
+    "/api/v1/fs/write": {
+      "post": {
+        "tags": ["fs"],
+        "summary": "Upload a file as a raw request body (streamed)",
+        "parameters": [
+          { "$ref": "#/components/parameters/PathQuery" },
+          { "name": "overwrite", "in": "query", "schema": { "type": "boolean", "default": false } },
+          { "name": "create_parents", "in": "query", "schema": { "type": "boolean", "default": true } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } }
+        },
+        "responses": {
+          "200": {
+            "description": "Written",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/WriteResult" } }
+            }
+          },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "413": { "$ref": "#/components/responses/PayloadTooLarge" }
+        }
+      }
+    },
+    "/api/v1/fs/upload": {
+      "post": {
+        "tags": ["fs"],
+        "summary": "Upload a file as multipart/form-data (streamed, field `file`)",
+        "parameters": [
+          { "$ref": "#/components/parameters/PathQuery" },
+          { "name": "overwrite", "in": "query", "schema": { "type": "boolean", "default": false } },
+          { "name": "create_parents", "in": "query", "schema": { "type": "boolean", "default": true } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": { "file": { "type": "string", "format": "binary" } },
+                "required": ["file"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Written",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/WriteResult" } }
+            }
+          },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" }
+        }
+      }
+    },
+    "/api/v1/sysinfo": {
+      "get": {
+        "tags": ["sysinfo"],
+        "summary": "Full machine snapshot",
+        "responses": {
+          "200": {
+            "description": "Snapshot",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/SysInfoSnapshot" } }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sysinfo/quick": {
+      "get": {
+        "tags": ["sysinfo"],
+        "summary": "Cheap CPU/memory/process snapshot",
+        "responses": {
+          "200": {
+            "description": "Quick status",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/QuickStatus" } }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sysinfo/processes": {
+      "get": {
+        "tags": ["sysinfo"],
+        "summary": "Process table",
+        "parameters": [
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 200 } },
+          { "name": "query", "in": "query", "schema": { "type": "string" } },
+          {
+            "name": "sort",
+            "in": "query",
+            "schema": { "type": "string", "enum": ["cpu", "memory", "pid", "name", "uptime"] }
+          },
+          { "name": "descending", "in": "query", "schema": { "type": "boolean", "default": true } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Processes",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/ProcessListResponse" } }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/capture/screens": {
+      "get": {
+        "tags": ["capture"],
+        "summary": "List displays",
+        "responses": {
+          "200": {
+            "description": "Screens",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/ScreenListResponse" } }
+            }
+          },
+          "503": { "$ref": "#/components/responses/Unavailable" }
+        }
+      }
+    },
+    "/api/v1/capture/windows": {
+      "get": {
+        "tags": ["capture"],
+        "summary": "List capturable windows",
+        "responses": {
+          "200": {
+            "description": "Windows",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/WindowListResponse" } }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/capture": {
+      "post": {
+        "tags": ["capture"],
+        "summary": "Capture as base64 JSON",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": { "schema": { "$ref": "#/components/schemas/CaptureRequest" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Frame with base64 payload",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/CaptureResponse" } }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "503": { "$ref": "#/components/responses/Unavailable" }
+        }
+      }
+    },
+    "/api/v1/capture/raw": {
+      "get": {
+        "tags": ["capture"],
+        "summary": "Capture as raw image bytes (usable in <img src>)",
+        "parameters": [
+          {
+            "name": "target",
+            "in": "query",
+            "schema": { "type": "string", "default": "primary", "examples": ["primary", "all", "screen:0", "window:1234"] }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "schema": { "type": "string", "enum": ["png", "jpeg", "bmp"], "default": "png" }
+          },
+          { "name": "quality", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100 } },
+          { "name": "max_width", "in": "query", "schema": { "type": "integer", "minimum": 1 } },
+          { "name": "max_height", "in": "query", "schema": { "type": "integer", "minimum": 1 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Encoded image",
+            "content": {
+              "image/png": { "schema": { "type": "string", "format": "binary" } },
+              "image/jpeg": { "schema": { "type": "string", "format": "binary" } },
+              "image/bmp": { "schema": { "type": "string", "format": "binary" } }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/v1/ws": {
+      "get": {
+        "tags": ["stream"],
+        "summary": "WebSocket stream (authenticated by one-time ticket)",
+        "security": [],
+        "parameters": [{ "name": "ticket", "in": "query", "required": true, "schema": { "type": "string" } }],
+        "responses": {
+          "101": { "description": "Switching protocols" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/v1/ws/info": {
+      "get": {
+        "tags": ["stream"],
+        "summary": "WebSocket limits and path",
+        "responses": {
+          "200": {
+            "description": "Streaming limits",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/WsInfo" } }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/logs": {
+      "get": {
+        "tags": ["diagnostics"],
+        "summary": "Recent log events (full scope only)",
+        "parameters": [
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 200, "maximum": 2000 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Log events, oldest first",
+            "content": {
+              "application/json": {
+                "schema": { "type": "array", "items": { "$ref": "#/components/schemas/LogEvent" } }
+              }
+            }
+          },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/api/v1/audit": {
+      "get": {
+        "tags": ["diagnostics"],
+        "summary": "Recent audit records (full scope only)",
+        "parameters": [
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 200, "maximum": 2000 } }
+        ],
+        "responses": {
+          "200": { "description": "Audit events, oldest first" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Session token from /api/v1/auth/login or an API key configured in server.api_keys."
+      }
+    },
+    "parameters": {
+      "PathQuery": {
+        "name": "path",
+        "in": "query",
+        "required": false,
+        "description": "Path inside the session jail. Relative paths resolve against the workspace root; omit to use its root.",
+        "schema": { "type": "string" }
+      }
+    },
+    "responses": {
+      "BadRequest": { "$ref": "#/components/responses/Envelope" },
+      "Unauthorized": { "$ref": "#/components/responses/Envelope" },
+      "Forbidden": { "$ref": "#/components/responses/Envelope" },
+      "NotFound": { "$ref": "#/components/responses/Envelope" },
+      "Conflict": { "$ref": "#/components/responses/Envelope" },
+      "Locked": { "$ref": "#/components/responses/Envelope" },
+      "PayloadTooLarge": { "$ref": "#/components/responses/Envelope" },
+      "UnsupportedMediaType": { "$ref": "#/components/responses/Envelope" },
+      "RangeNotSatisfiable": { "$ref": "#/components/responses/Envelope" },
+      "RateLimited": { "$ref": "#/components/responses/Envelope" },
+      "Unavailable": { "$ref": "#/components/responses/Envelope" },
+      "Timeout": { "$ref": "#/components/responses/Envelope" },
+      "Envelope": {
+        "description": "Error envelope; the HTTP status follows the error code",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/ApiErrorBody" } }
+        }
+      }
+    },
+    "schemas": {
+      "ApiErrorBody": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": ["code", "message"],
+            "properties": {
+              "code": {
+                "type": "string",
+                "enum": [
+                  "bad_request", "unauthorized", "forbidden", "not_found", "conflict",
+                  "payload_too_large", "unsupported_media_type", "range_not_satisfiable",
+                  "invalid_path", "scope_violation", "policy_denied", "timeout",
+                  "rate_limited", "locked", "unavailable", "not_implemented", "internal"
+                ]
+              },
+              "message": { "type": "string" },
+              "detail": {},
+              "request_id": { "type": "string" },
+              "retry_after_secs": { "type": "integer", "minimum": 0 }
+            }
+          }
+        }
+      },
+      "Ack": {
+        "type": "object",
+        "required": ["ok"],
+        "properties": { "ok": { "type": "boolean" }, "message": { "type": "string" } }
+      },
+      "Scope": { "type": "string", "enum": ["workspace", "full"] },
+      "ServerInfo": {
+        "type": "object",
+        "required": ["name", "app_version", "protocol_version", "max_scope", "capabilities"],
+        "properties": {
+          "name": { "type": "string" },
+          "app_version": { "type": "string" },
+          "protocol_version": { "type": "string" },
+          "hostname": { "type": "string" },
+          "os": { "type": "string" },
+          "arch": { "type": "string" },
+          "max_scope": { "$ref": "#/components/schemas/Scope" },
+          "issued_scope": { "$ref": "#/components/schemas/Scope" },
+          "cert_fingerprint": { "type": "string", "description": "SHA-256 of the server certificate, colon separated" },
+          "capabilities": { "type": "array", "items": { "type": "string" } },
+          "started_at": { "type": "string", "format": "date-time" },
+          "uptime_secs": { "type": "integer" },
+          "endpoints": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "SessionInfo": {
+        "type": "object",
+        "required": ["username", "scope", "expires_at", "issued_at", "auth_kind"],
+        "properties": {
+          "username": { "type": "string" },
+          "scope": { "$ref": "#/components/schemas/Scope" },
+          "expires_at": { "type": "string", "format": "date-time" },
+          "issued_at": { "type": "string", "format": "date-time" },
+          "auth_kind": { "type": "string", "enum": ["password", "api_key"] },
+          "device_name": { "type": "string" },
+          "remote_addr": { "type": "string" }
+        }
+      },
+      "LoginRequest": {
+        "type": "object",
+        "required": ["username", "password"],
+        "properties": {
+          "username": { "type": "string" },
+          "password": { "type": "string", "writeOnly": true },
+          "device_name": { "type": "string" }
+        }
+      },
+      "LoginResponse": {
+        "type": "object",
+        "required": ["access_token", "token_type", "expires_in_secs", "expires_at", "scope", "username", "server"],
+        "properties": {
+          "access_token": { "type": "string" },
+          "token_type": { "type": "string", "default": "Bearer" },
+          "expires_in_secs": { "type": "integer" },
+          "expires_at": { "type": "string", "format": "date-time" },
+          "scope": { "$ref": "#/components/schemas/Scope" },
+          "username": { "type": "string" },
+          "server": { "$ref": "#/components/schemas/ServerInfo" }
+        }
+      },
+      "WsTicketResponse": {
+        "type": "object",
+        "required": ["ticket", "expires_in_secs", "ws_path"],
+        "properties": {
+          "ticket": { "type": "string" },
+          "expires_in_secs": { "type": "integer" },
+          "ws_path": { "type": "string", "default": "/api/v1/ws" }
+        }
+      },
+      "ShellKind": {
+        "type": "object",
+        "required": ["kind"],
+        "properties": {
+          "kind": { "type": "string", "enum": ["cmd", "powershell", "pwsh", "custom"] },
+          "program": { "type": "string" },
+          "args": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "ExecRequest": {
+        "type": "object",
+        "required": ["shell", "command"],
+        "properties": {
+          "shell": { "$ref": "#/components/schemas/ShellKind" },
+          "command": { "type": "string" },
+          "cwd": { "type": "string" },
+          "env": { "type": "object", "additionalProperties": { "type": "string" } },
+          "timeout_ms": { "type": "integer" },
+          "max_output_bytes": { "type": "integer" },
+          "encoding": { "type": "string", "enum": ["auto", "utf8", "gbk", "raw"], "default": "auto" },
+          "stdin_b64": { "type": "string" }
+        }
+      },
+      "ExecResult": {
+        "type": "object",
+        "required": ["exit_code", "stdout", "stderr", "duration_ms", "shell"],
+        "properties": {
+          "exit_code": { "type": "integer" },
+          "stdout": { "type": "string" },
+          "stderr": { "type": "string" },
+          "timed_out": { "type": "boolean" },
+          "truncated": { "type": "boolean" },
+          "duration_ms": { "type": "integer" },
+          "shell": { "type": "string" },
+          "effective_cwd": { "type": "string" },
+          "encoding": { "type": "string" },
+          "pid": { "type": "integer" },
+          "stdout_bytes": { "type": "integer" },
+          "stderr_bytes": { "type": "integer" }
+        }
+      },
+      "ShellListResponse": {
+        "type": "object",
+        "properties": {
+          "shells": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "shell": { "type": "string" },
+                "available": { "type": "boolean" },
+                "path": { "type": "string" },
+                "version": { "type": "string" }
+              }
+            }
+          },
+          "default_shell": { "type": "string" }
+        }
+      },
+      "FsEntry": {
+        "type": "object",
+        "required": ["name", "path", "is_dir"],
+        "properties": {
+          "name": { "type": "string" },
+          "path": { "type": "string" },
+          "is_dir": { "type": "boolean" },
+          "is_symlink": { "type": "boolean" },
+          "is_reparse_point": { "type": "boolean" },
+          "size": { "type": "integer" },
+          "modified_ms": { "type": "integer" },
+          "created_ms": { "type": "integer" },
+          "accessed_ms": { "type": "integer" },
+          "readonly": { "type": "boolean" },
+          "hidden": { "type": "boolean" },
+          "attributes": { "type": "array", "items": { "type": "string" } },
+          "error": { "type": "string" }
+        }
+      },
+      "ListDirResponse": {
+        "type": "object",
+        "required": ["path", "entries", "scope"],
+        "properties": {
+          "path": { "type": "string" },
+          "parent": { "type": "string" },
+          "entries": { "type": "array", "items": { "$ref": "#/components/schemas/FsEntry" } },
+          "truncated": { "type": "boolean" },
+          "scope": { "$ref": "#/components/schemas/Scope" },
+          "total_entries": { "type": "integer" }
+        }
+      },
+      "StatResponse": {
+        "type": "object",
+        "required": ["entry"],
+        "properties": {
+          "entry": { "$ref": "#/components/schemas/FsEntry" },
+          "volume_free_bytes": { "type": "integer" },
+          "volume_total_bytes": { "type": "integer" }
+        }
+      },
+      "MkdirRequest": {
+        "type": "object",
+        "required": ["path"],
+        "properties": {
+          "path": { "type": "string" },
+          "create_parents": { "type": "boolean", "default": true },
+          "allow_existing": { "type": "boolean", "default": false }
+        }
+      },
+      "DeleteRequest": {
+        "type": "object",
+        "required": ["paths"],
+        "properties": {
+          "paths": { "type": "array", "items": { "type": "string" } },
+          "recursive": { "type": "boolean", "default": false },
+          "even_if_readonly": { "type": "boolean", "default": false }
+        }
+      },
+      "DeleteResult": {
+        "type": "object",
+        "properties": {
+          "deleted": { "type": "array", "items": { "type": "string" } },
+          "failed": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "path": { "type": "string" },
+                "code": { "type": "string" },
+                "message": { "type": "string" }
+              }
+            }
+          }
+        }
+      },
+      "RenameRequest": {
+        "type": "object",
+        "required": ["from", "to"],
+        "properties": {
+          "from": { "type": "string" },
+          "to": { "type": "string" },
+          "overwrite": { "type": "boolean", "default": false }
+        }
+      },
+      "CopyRequest": {
+        "type": "object",
+        "required": ["from", "to"],
+        "properties": {
+          "from": { "type": "string" },
+          "to": { "type": "string" },
+          "overwrite": { "type": "boolean", "default": false },
+          "recursive": { "type": "boolean", "default": true }
+        }
+      },
+      "WriteResult": {
+        "type": "object",
+        "required": ["path", "size"],
+        "properties": {
+          "path": { "type": "string" },
+          "size": { "type": "integer" },
+          "sha256": { "type": "string" },
+          "overwritten": { "type": "boolean" },
+          "duration_ms": { "type": "integer" }
+        }
+      },
+      "ReadFileResult": {
+        "type": "object",
+        "required": ["path", "size", "offset", "returned", "content_b64"],
+        "properties": {
+          "path": { "type": "string" },
+          "size": { "type": "integer" },
+          "offset": { "type": "integer" },
+          "returned": { "type": "integer" },
+          "truncated": { "type": "boolean" },
+          "content_b64": { "type": "string" },
+          "text": { "type": "string" },
+          "encoding": { "type": "string" },
+          "partial_line": { "type": "boolean" }
+        }
+      },
+      "FsRoots": {
+        "type": "object",
+        "required": ["scope", "drives", "quick_paths"],
+        "properties": {
+          "scope": { "$ref": "#/components/schemas/Scope" },
+          "workspace_root": { "type": "string" },
+          "drives": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "path": { "type": "string" },
+                "label": { "type": "string" },
+                "fs_type": { "type": "string" },
+                "total_bytes": { "type": "integer" },
+                "free_bytes": { "type": "integer" },
+                "removable": { "type": "boolean" }
+              }
+            }
+          },
+          "quick_paths": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "label": { "type": "string" },
+                "path": { "type": "string" },
+                "kind": { "type": "string" }
+              }
+            }
+          }
+        }
+      },
+      "SysInfoSnapshot": {
+        "type": "object",
+        "description": "Host, CPU, memory, disk, network, display and app facts",
+        "required": ["hostname", "os_name", "cpu", "memory", "app"],
+        "properties": {
+          "hostname": { "type": "string" },
+          "os_name": { "type": "string" },
+          "os_version": { "type": "string" },
+          "os_build": { "type": "string" },
+          "arch": { "type": "string" },
+          "username": { "type": "string" },
+          "domain": { "type": "string" },
+          "cpu": {
+            "type": "object",
+            "properties": {
+              "brand": { "type": "string" },
+              "physical_cores": { "type": "integer" },
+              "logical_cores": { "type": "integer" },
+              "usage_percent": { "type": "number" },
+              "frequency_mhz": { "type": "integer" }
+            }
+          },
+          "memory": {
+            "type": "object",
+            "properties": {
+              "total_bytes": { "type": "integer" },
+              "used_bytes": { "type": "integer" },
+              "available_bytes": { "type": "integer" },
+              "swap_total_bytes": { "type": "integer" },
+              "swap_used_bytes": { "type": "integer" },
+              "usage_percent": { "type": "number" }
+            }
+          },
+          "disks": { "type": "array", "items": { "type": "object" } },
+          "networks": { "type": "array", "items": { "type": "object" } },
+          "displays": { "type": "array", "items": { "$ref": "#/components/schemas/ScreenInfo" } },
+          "battery": { "type": "object" },
+          "uptime_secs": { "type": "integer" },
+          "boot_time": { "type": "string" },
+          "server_time": { "type": "string" },
+          "timezone": { "type": "string" },
+          "process_count": { "type": "integer" },
+          "load_average": { "type": "array", "items": { "type": "number" } },
+          "app": {
+            "type": "object",
+            "properties": {
+              "version": { "type": "string" },
+              "protocol_version": { "type": "string" },
+              "server_enabled": { "type": "boolean" },
+              "active_sessions": { "type": "integer" },
+              "uptime_secs": { "type": "integer" },
+              "scope": { "$ref": "#/components/schemas/Scope" },
+              "workspace_root": { "type": "string" },
+              "config_path": { "type": "string" },
+              "data_dir": { "type": "string" },
+              "server": { "$ref": "#/components/schemas/ServerInfo" }
+            }
+          }
+        }
+      },
+      "QuickStatus": {
+        "type": "object",
+        "required": ["cpu_usage_percent", "memory_used_bytes", "memory_total_bytes", "process_count", "sampled_at"],
+        "properties": {
+          "cpu_usage_percent": { "type": "number" },
+          "memory_used_bytes": { "type": "integer" },
+          "memory_total_bytes": { "type": "integer" },
+          "process_count": { "type": "integer" },
+          "uptime_secs": { "type": "integer" },
+          "sampled_at": { "type": "string" },
+          "battery_percent": { "type": "number" },
+          "active_sessions": { "type": "integer" }
+        }
+      },
+      "ProcessListResponse": {
+        "type": "object",
+        "required": ["processes", "total", "sampled_at"],
+        "properties": {
+          "processes": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "pid": { "type": "integer" },
+                "parent_pid": { "type": "integer" },
+                "name": { "type": "string" },
+                "exe": { "type": "string" },
+                "cmd": { "type": "string" },
+                "cpu_percent": { "type": "number" },
+                "memory_bytes": { "type": "integer" },
+                "run_time_secs": { "type": "integer" },
+                "user": { "type": "string" },
+                "started_at": { "type": "string" }
+              }
+            }
+          },
+          "total": { "type": "integer" },
+          "truncated": { "type": "boolean" },
+          "sampled_at": { "type": "string" }
+        }
+      },
+      "CaptureTarget": {
+        "type": "object",
+        "required": ["kind"],
+        "properties": {
+          "kind": { "type": "string", "enum": ["primary", "screen", "all_screens", "window"] },
+          "id": { "type": "integer", "description": "Screen id for `screen`, window handle for `window`" }
+        }
+      },
+      "CaptureRequest": {
+        "type": "object",
+        "properties": {
+          "target": { "$ref": "#/components/schemas/CaptureTarget" },
+          "format": { "type": "string", "enum": ["png", "jpeg", "bmp"], "default": "png" },
+          "quality": { "type": "integer", "minimum": 1, "maximum": 100 },
+          "max_width": { "type": "integer", "minimum": 1 },
+          "max_height": { "type": "integer", "minimum": 1 }
+        }
+      },
+      "CaptureResponse": {
+        "type": "object",
+        "required": ["format", "width", "height", "bytes", "captured_at_ms", "data_b64"],
+        "properties": {
+          "format": { "type": "string", "enum": ["png", "jpeg", "bmp"] },
+          "width": { "type": "integer" },
+          "height": { "type": "integer" },
+          "bytes": { "type": "integer" },
+          "captured_at_ms": { "type": "integer" },
+          "duration_ms": { "type": "integer" },
+          "target": { "type": "string" },
+          "resized": { "type": "boolean" },
+          "data_b64": { "type": "string" }
+        }
+      },
+      "ScreenInfo": {
+        "type": "object",
+        "required": ["id", "width", "height"],
+        "properties": {
+          "id": { "type": "integer" },
+          "name": { "type": "string" },
+          "width": { "type": "integer" },
+          "height": { "type": "integer" },
+          "x": { "type": "integer" },
+          "y": { "type": "integer" },
+          "scale_factor": { "type": "number" },
+          "is_primary": { "type": "boolean" },
+          "refresh_hz": { "type": "integer" },
+          "is_capturable": { "type": "boolean" }
+        }
+      },
+      "ScreenListResponse": {
+        "type": "object",
+        "properties": { "screens": { "type": "array", "items": { "$ref": "#/components/schemas/ScreenInfo" } } }
+      },
+      "WindowListResponse": {
+        "type": "object",
+        "properties": {
+          "windows": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": { "type": "integer" },
+                "title": { "type": "string" },
+                "app_name": { "type": "string" },
+                "process_path": { "type": "string" },
+                "pid": { "type": "integer" },
+                "x": { "type": "integer" },
+                "y": { "type": "integer" },
+                "width": { "type": "integer" },
+                "height": { "type": "integer" },
+                "is_foreground": { "type": "boolean" },
+                "is_minimized": { "type": "boolean" },
+                "is_visible": { "type": "boolean" },
+                "is_capturable": { "type": "boolean" }
+              }
+            }
+          },
+          "truncated": { "type": "boolean" },
+          "sampled_at": { "type": "string" }
+        }
+      },
+      "WsInfo": {
+        "type": "object",
+        "required": ["path", "max_message_bytes", "max_frame_fps", "max_concurrent_streams"],
+        "properties": {
+          "path": { "type": "string" },
+          "max_message_bytes": { "type": "integer" },
+          "max_frame_fps": { "type": "integer" },
+          "max_concurrent_streams": { "type": "integer" }
+        }
+      },
+      "LogEvent": {
+        "type": "object",
+        "required": ["ts_ms", "level", "target", "message"],
+        "properties": {
+          "ts_ms": { "type": "integer" },
+          "level": { "type": "string" },
+          "target": { "type": "string" },
+          "message": { "type": "string" },
+          "fields": { "type": "string" }
+        }
+      },
+      "WsClientMessage": {
+        "type": "object",
+        "description": "Tagged by `type`: ping, exec, cancel, capture_stream, subscribe_logs, subscribe_status, unsubscribe",
+        "required": ["type"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["ping", "exec", "cancel", "capture_stream", "subscribe_logs", "subscribe_status", "unsubscribe"]
+          },
+          "id": { "type": "integer" },
+          "request": { "description": "ExecRequest or CaptureRequest depending on `type`" },
+          "fps": { "type": "integer" },
+          "max_frames": { "type": "integer" },
+          "level": { "type": "string" },
+          "backlog": { "type": "integer" }
+        }
+      },
+      "WsServerMessage": {
+        "type": "object",
+        "description": "Tagged by `type`: pong, accepted, exec_started, exec_output, exec_finished, capture_frame, capture_stopped, log, status, unsubscribed, error",
+        "required": ["type"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "pong", "accepted", "exec_started", "exec_output", "exec_finished",
+              "capture_frame", "capture_stopped", "log", "status", "unsubscribed", "error"
+            ]
+          },
+          "id": { "type": "integer" },
+          "detail": { "type": "string" },
+          "pid": { "type": "integer" },
+          "shell": { "type": "string" },
+          "stream": { "type": "string", "enum": ["stdout", "stderr", "notice"] },
+          "data": { "type": "string" },
+          "seq": { "type": "integer" },
+          "summary": { "type": "object" },
+          "stdout_tail": { "type": "string" },
+          "stderr_tail": { "type": "string" },
+          "frame": { "type": "object" },
+          "reason": { "type": "string" },
+          "frames": { "type": "integer" },
+          "event": { "$ref": "#/components/schemas/LogEvent" },
+          "status": { "$ref": "#/components/schemas/QuickStatus" },
+          "error": { "type": "object" }
+        }
+      }
+    }
+  }
+}
