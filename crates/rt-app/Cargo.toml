@@ -28,6 +28,9 @@ image = { workspace = true }
 
 clap = { workspace = true }
 tokio = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+fs2 = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

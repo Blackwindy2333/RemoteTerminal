@@ -36,6 +36,7 @@ tokio = { version = "1.40", features = [
     "macros",
     "fs",
     "io-util",
+    "io-std",
     "net",
     "process",
     "sync",
@@ -125,7 +126,7 @@ eframe = { version = "0.37", default-features = false, features = [
     "persistence",
 ] }
 egui = "0.37"
-egui_extras = { version = "0.37", features = ["image", "datepicker"] }
+egui_extras = { version = "0.37", features = ["image"] }
 rfd = "0.15"
 
 # --- misc ---
