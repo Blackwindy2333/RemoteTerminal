@@ -404,8 +404,10 @@ fn grab_primary() -> Result<(RgbaImage, String)> {
                 "no monitor available for capture (is an interactive desktop attached?)".into(),
             )
         })?;
-    let (image, description) = grab_monitor(monitor)?;
-    Ok((image, format!("{description} primary")))
+    let id = monitor.id().unwrap_or(0);
+    let image = grab_monitor(monitor)?;
+    let description = format!("screen:{id} primary ({}x{})", image.width(), image.height());
+    Ok((image, description))
 }
 
 fn grab_screen(id: u32) -> Result<(RgbaImage, String)> {
@@ -414,10 +416,12 @@ fn grab_screen(id: u32) -> Result<(RgbaImage, String)> {
         .iter()
         .find(|monitor| monitor.id().map(|monitor_id| monitor_id == id).unwrap_or(false))
         .ok_or_else(|| RtError::not_found(format!("screen {id} does not exist")))?;
-    grab_monitor(monitor)
+    let image = grab_monitor(monitor)?;
+    let description = format!("screen:{id} ({}x{})", image.width(), image.height());
+    Ok((image, description))
 }
 
-fn grab_monitor(monitor: &xcap::Monitor) -> Result<(RgbaImage, String)> {
+fn grab_monitor(monitor: &xcap::Monitor) -> Result<RgbaImage> {
     let id = monitor.id().unwrap_or(0);
     let width = monitor.width().map_err(|err| unavailable(&format!("screen {id} geometry unavailable"), err))?;
     let height = monitor.height().map_err(|err| unavailable(&format!("screen {id} geometry unavailable"), err))?;
@@ -433,8 +437,7 @@ fn grab_monitor(monitor: &xcap::Monitor) -> Result<(RgbaImage, String)> {
     if image.width() == 0 || image.height() == 0 {
         return Err(RtError::Unavailable(format!("screen {id} produced an empty frame")));
     }
-    let description = format!("screen:{id} ({}x{})", image.width(), image.height());
-    Ok((image, description))
+    Ok(image)
 }
 
 /// Stitches every monitor into one canvas that mirrors the virtual-desktop
@@ -458,12 +461,12 @@ fn grab_all_screens() -> Result<(RgbaImage, String)> {
                 continue;
             }
         };
-        if let Ok(width) = monitor.width() {
-            if let Ok(height) = monitor.height() {
-                if check_pixel_budget(width, height, "screen").is_err() {
-                    tracing::warn!(target: "capture", screen = id, width, height, "monitor skipped: too large");
-                    continue;
-                }
+        // A monitor whose geometry we cannot read *or* that would blow the
+        // canvas budget is skipped, leaving that part of the canvas black.
+        if let Some((width, height)) = monitor.width().ok().zip(monitor.height().ok()) {
+            if let Err(err) = check_pixel_budget(width, height, "screen") {
+                tracing::warn!(target: "capture", screen = id, error = %err, "monitor skipped");
+                continue;
             }
         }
         match monitor.capture_image() {
@@ -740,6 +743,54 @@ mod tests {
     }
 
     #[test]
+    fn list_windows_works() {
+        let windows = match list_windows() {
+            Ok(windows) => windows,
+            Err(err) => {
+                eprintln!("list_windows failed in this session, skipping assertions: {err}");
+                return;
+            }
+        };
+        if windows.is_empty() {
+            eprintln!("no top-level window reported (locked or disconnected session?), skipping assertions");
+            return;
+        }
+
+        let mut foreground = 0;
+        for window in &windows {
+            assert!(
+                window.width > 0 && window.height > 0,
+                "window {} has an empty geometry {}x{}",
+                window.id,
+                window.width,
+                window.height
+            );
+            // `WindowInfo::id` is the HWND widened to u64, so it must fit in 32 bits.
+            assert!(
+                window.id <= u64::from(u32::MAX),
+                "window id {} is not an HWND",
+                window.id
+            );
+            // `xcap` only lists windows that `IsWindowVisible` calls visible; the
+            // same query through our own FFI must agree.
+            assert!(window.is_visible, "window {} is listed but not visible", window.id);
+            if window.is_foreground {
+                foreground += 1;
+            }
+            if let Some(pid) = window.pid {
+                assert!(pid > 0, "window {} reported pid 0", window.id);
+            }
+            if window.is_capturable {
+                assert!(!window.title.is_empty(), "window {} is capturable but untitled", window.id);
+                assert!(!window.is_minimized, "window {} is capturable while minimized", window.id);
+            }
+        }
+        // Several windows can be listed, but only one can hold the focus.
+        assert!(foreground <= 1, "{foreground} windows claim to be the foreground window");
+        eprintln!("enumerated {} windows ({foreground} foreground)", windows.len());
+    }
+
+    #[test]
     fn capture_primary_produces_png() {
         let request = CaptureRequest::png(CaptureTarget::Primary);
         let response = match capture(&request) {
@@ -754,6 +805,15 @@ mod tests {
         assert!(!response.meta.resized, "no cap was requested, nothing should be resized");
         assert!(response.meta.width > 0 && response.meta.height > 0);
         assert!(response.meta.target.starts_with("screen:"), "unexpected target label: {}", response.meta.target);
+        eprintln!(
+            "captured {} at {}x{}, {} bytes in {}ms, {}ms since the epoch stamp",
+            response.meta.target,
+            response.meta.width,
+            response.meta.height,
+            response.meta.bytes,
+            response.meta.duration_ms,
+            response.meta.captured_at_ms
+        );
 
         let bytes = response.into_bytes().expect("data_b64 must be valid base64");
         assert_eq!(bytes.len() as u64, response.meta.bytes);
@@ -765,6 +825,45 @@ mod tests {
             .expect("produced PNG must decode");
         assert_eq!(decoded.width(), response.meta.width);
         assert_eq!(decoded.height(), response.meta.height);
+    }
+
+    #[test]
+    fn window_capture_produces_png() {
+        let windows = match list_windows() {
+            Ok(windows) => windows,
+            Err(err) => {
+                eprintln!("skipping: window enumeration unavailable ({err})");
+                return;
+            }
+        };
+        let Some(window) = windows
+            .iter()
+            .find(|window| window.is_capturable && window.width >= 16 && window.height >= 16)
+        else {
+            eprintln!("no capturable window to sample, skipping");
+            return;
+        };
+
+        let request = CaptureRequest::png(CaptureTarget::Window { id: window.id });
+        let response = match capture(&request) {
+            Ok(response) => response,
+            Err(err) => {
+                // `PrintWindow` legitimately refuses some windows (protected,
+                // elevated, hardware-overlay); that is not a test failure.
+                eprintln!("skipping: window {} capture refused ({err})", window.id);
+                return;
+            }
+        };
+
+        assert_eq!(response.meta.format, ImageFormat::Png);
+        assert!(
+            response.meta.target.starts_with("window:"),
+            "unexpected target label: {}",
+            response.meta.target
+        );
+        let bytes = response.into_bytes().expect("data_b64 must be valid base64");
+        assert!(bytes.len() > 100, "window PNG looks truncated: {} bytes", bytes.len());
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "missing PNG signature");
     }
 
     #[test]
@@ -870,5 +969,20 @@ mod tests {
         assert!(second > first, "stamps must strictly increase: {first} then {second}");
         // Sanity: the stamp looks like a real epoch timestamp in this century.
         assert!(first > 1_600_000_000_000, "unexpected stamp: {first}");
+    }
+
+    #[test]
+    fn is_available_caches_probe() {
+        let first = is_available();
+        assert_eq!(first, is_available(), "the availability probe must be cached");
+        if first {
+            // A positive verdict must match what listing actually does.
+            assert!(
+                list_screens().is_ok(),
+                "is_available() said yes but list_screens() failed"
+            );
+        } else {
+            eprintln!("capture reported unavailable in this session (no interactive desktop?)");
+        }
     }
 }
