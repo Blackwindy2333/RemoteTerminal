@@ -38,10 +38,29 @@ surface; `GET /healthz` needs no authentication and is safe for probes.
   Escape attempts (`..\..`, UNC paths, NTFS alternate data streams, device
   names, `\\?\GLOBALROOT`, symlink/reparse traversal) are rejected with
   `403 scope_violation`.
+* **Scope is a capability boundary** — `workspace` sessions are file/read-only
+  guests: `POST /api/v1/exec`, `GET /api/v1/capture`, `/capture/raw`,
+  `/capture/windows`, `/sysinfo/processes`, `/logs` and `/audit`, plus the WS
+  `exec`, `capture_stream` and `subscribe_logs` messages, all answer
+  `403 forbidden` with `“… requires the full scope …”`. `workspace` keeps the
+  file API, `/sysinfo`, `/sysinfo/quick`, `/capture/screens` and `/exec/shells`.
+* **Control files are never remote** — `config.toml` (and `.bak`), the TLS
+  directory and its private key, `logs/audit.jsonl` and `data/instance.lock`
+  are unreachable from every session, at any scope (deny-listed at start-up in
+  `pathscope::protect_paths`). A full-scope session can still break the host,
+  but it cannot silently grant itself more scope or replace the certificate.
+* **No credential over an unverified peer** — CLI/MCP clients never send a
+  password on an unpinned TLS connection: when `client.require_pinned_fingerprint`
+  is on they perform one unauthenticated `GET /healthz` probe, report the
+  presented fingerprint, and abort with an instruction to pin it
+  (`--fingerprint`, `RT_FINGERPRINT` or `[[client.hosts]] fingerprint`). The GUI
+  shows a trust dialog for the first connection.
 * **Auditing** — every mutating call appends a JSON line to
   `<logs dir>/audit.jsonl` with user, scope, source address, target and result.
 * **Default posture** — `server.enabled = false`; nothing listens until the user
-  turns the server on and adds at least one user with a password.
+  turns the server on and adds at least one user with a password. Both
+  `remote-terminal serve` and the GUI refuse to bind a configuration that
+  `Config::validate()` rejects (e.g. `tls = false` on a non-loopback bind).
 
 ## 2. Running a server
 
@@ -82,6 +101,10 @@ Fingerprint pinning from PowerShell:
 ```
 
 ## 4. Command execution
+
+> **Requires the `full` scope.** A `workspace` session gets `403 forbidden`
+> (`executing commands requires the full scope`). `GET /exec/shells` stays open
+> so a client can discover capabilities before asking for privileges.
 
 ```powershell
 $exec = @{
@@ -132,12 +155,15 @@ response (`WriteResult`) includes the SHA-256 of what landed on disk.
   displays, battery, uptime, app/server info)
 * `GET /api/v1/sysinfo/quick` → `QuickStatus` (cheap polling)
 * `GET /api/v1/sysinfo/processes?limit=&query=&sort=cpu|memory|name|pid` →
-  `ProcessListResponse`
-* `GET /api/v1/capture/screens` → monitors
-* `GET /api/v1/capture/windows` → top-level windows
-* `POST /api/v1/capture` → `CaptureResponse` (base64 payload + metadata)
+  `ProcessListResponse` — **`full` scope only** (process command lines leak host
+  reconnaissance), the two endpoints above stay readable for `workspace`
+  sessions
+* `GET /api/v1/capture/screens` → monitors (`workspace` may list geometry)
+* `GET /api/v1/capture/windows` → top-level windows — **`full` scope only**
+* `POST /api/v1/capture` → `CaptureResponse` (base64 payload + metadata) —
+  **`full` scope only**
 * `GET /api/v1/capture/raw?target=primary|all|screen:1|window:12345&format=png|jpeg&quality=75`
-  → image bytes with the proper `Content-Type`
+  → image bytes with the proper `Content-Type` — **`full` scope only**
 
 ```powershell
 Invoke-WebRequest -Uri "$base/api/v1/capture/raw?target=primary&format=png" `
@@ -146,15 +172,22 @@ Invoke-WebRequest -Uri "$base/api/v1/capture/raw?target=primary&format=png" `
 
 ## 7. WebSocket
 
-1. `POST /api/v1/auth/ws-ticket` → `{ ticket, expires_in_secs, ws_path }`
+1. `POST /api/v1/auth/ws-ticket` (POST only) → `{ ticket, expires_in_secs, ws_path }`
    (tickets are single use and bound to your session).
 2. Connect to `wss://host:port/api/v1/ws?ticket=…`.
 3. Client → server (`WsClientMessage`, tagged by `type`):
    `ping`, `exec`, `cancel`, `capture_stream`, `subscribe_logs`,
    `subscribe_status`, `unsubscribe`.
+   `exec`, `capture_stream` and `subscribe_logs` need the `full` scope and are
+   answered with a `forbidden` `error` frame otherwise; `subscribe_status` is
+   open to every session.
 4. Server → client: `pong`, `accepted`, `exec_started`, `exec_output`,
    `exec_finished`, `capture_frame`, `capture_stopped`, `log`, `status`,
    `unsubscribed`, `error`.
+5. Backpressure: the outbound queue holds 256 messages; a client that stops
+   reading loses frames (they are counted) and then receives an `error` frame
+   saying how many were dropped, so memory never grows without bound. The final
+   `exec_finished` summary is always delivered.
 
 ```jsonc
 // run a command with live output

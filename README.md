@@ -133,21 +133,40 @@ Example:
       "enabled": true,
       "command": "D:\\Tools\\RemoteTerminal\\remote-terminal.exe",
       "args": ["mcp"],
-      "env": { "RT_HOST": "192.168.1.10:46666", "RT_PASSWORD": "…" }
+      "env": {
+        "RT_HOST": "192.168.1.10:46666",
+        "RT_PASSWORD": "…",
+        "RT_FINGERPRINT": "AB:CD:… (from `remote-terminal fingerprint 192.168.1.10:46666`)"
+      }
     }
   }
 }
 ```
 
+> The MCP bridge has no terminal to confirm a certificate with, so it refuses
+> to send a password over an unpinned TLS connection: pin `RT_FINGERPRINT` (or
+> `fingerprint` on the `[[client.hosts]]` entry) before the first login. When it
+> is missing the tool returns an error that contains the fingerprint it saw, so
+> pinning is a two-step copy/paste.
+
 ## Security notes
 
 * Defaults are conservative: server off, TLS on, 720-minute sessions, 5 login
   attempts, 240 requests/minute/IP.
-* Prefer the **workspace** scope for automation: the session can only touch
-  `server.workspace.root`. `full` scope is root-equivalent over the network —
-  hand it out deliberately.
+* **Scope is a capability boundary:** `workspace` sessions can browse and edit
+  files under `server.workspace.root` and read `sysinfo`; **command execution,
+  screen capture and log tails require `full`**. A workspace token can never
+  turn into a remote shell.
+* Prefer the **workspace** scope for automation. `full` scope is
+  root-equivalent over the network — hand it out deliberately.
+* Even `full` sessions cannot touch `config.toml`/`.bak`, the TLS private key,
+  `logs/audit.jsonl` or `data/instance.lock` (deny-listed at start-up), so a
+  session cannot silently widen its own scope, replace the certificate or erase
+  the audit trail. See [`docs/SECURITY.md`](docs/SECURITY.md) for the full threat
+  model and the audit of every attack surface.
 * `server.allow_insecure_lan` disables TLS; only use it on loopback while
-  debugging.
+  debugging. `serve` (CLI *and* GUI) refuses to bind a configuration that
+  `validate()` rejects, so a typo cannot silently put passwords in plaintext.
 * Exposing the port to the internet is **not** recommended. If you must, put it
   behind a VPN or a reverse proxy and keep the fingerprint pinned.
 * The audit trail (`logs/audit.jsonl`) records every mutating call.
