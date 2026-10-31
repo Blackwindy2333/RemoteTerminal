@@ -12,6 +12,7 @@
 //! long as they are inside the root.
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 
 use rt_protocol::Scope;
 
@@ -101,6 +102,7 @@ impl PathGuard {
                 )));
             }
         }
+        check_protected(&real)?;
         Ok(real)
     }
 
@@ -199,6 +201,16 @@ fn validate_syntax(input: &str) -> Result<PathBuf> {
             "device namespace paths are not allowed".into(),
         ));
     }
+    // Extended-length / verbatim paths first: `\\?\C:\Windows` and
+    // `\\?\UNC\host\share` are both "verbatim" prefixes, and the specific
+    // reason ("don't smuggle a verbatim path") is more useful than a generic
+    // UNC rejection. We only ever add `\\?\` ourselves when handing a path to
+    // the OS (`to_extended`), never accept one from a caller.
+    if trimmed.starts_with("\\\\?\\") || trimmed.starts_with("//?/") {
+        return Err(RtError::InvalidPath(
+            "extended-length (`\\\\?\\`) paths are not accepted".into(),
+        ));
+    }
     // Network shares are refused outright: they would make the server act as a
     // credential relay towards third-party SMB hosts.
     if trimmed.starts_with("\\\\") || trimmed.starts_with("//") {
@@ -226,7 +238,12 @@ fn validate_syntax(input: &str) -> Result<PathBuf> {
             Component::Prefix(prefix) => {
                 use std::path::Prefix;
                 match prefix.kind() {
-                    Prefix::Disk(_) | Prefix::VerbatimDisk(_) => {}
+                    Prefix::Disk(_) => {}
+                    Prefix::VerbatimDisk(_) => {
+                        return Err(RtError::InvalidPath(
+                            "extended-length (`\\\\?\\`) paths are not accepted".into(),
+                        ))
+                    }
                     Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _) => {
                         return Err(RtError::PolicyDenied(
                             "UNC / network share paths are not supported".into(),
@@ -410,6 +427,66 @@ pub fn resolve_for_io(guard: &PathGuard, input: &str) -> Result<PathBuf> {
     Ok(to_extended(&guard.resolve(input)?))
 }
 
+// ---------------------------------------------------------------------------
+// Protected control paths
+// ---------------------------------------------------------------------------
+
+/// Server control files that no remote session may touch, whatever its scope.
+///
+/// A full-scope session is supposed to roam the whole machine, but three paths
+/// must stay out of reach or the scope graph collapses:
+///
+/// * `config.toml` (+ its `.bak`) — a session that can rewrite it can add
+///   itself a user, widen its own scope, or point the TLS material elsewhere;
+/// * the TLS directory — the private key must never be readable or replaceable,
+///   otherwise a session could impersonate the host on the next connection;
+/// * the audit trail and the single-instance lock — tampering with them lets a
+///   session erase evidence.
+///
+/// The set is process-wide and installed once during start-up (see
+/// `rt_app::bootstrap`), before the server starts accepting connections.
+static PROTECTED: OnceLock<Vec<PathBuf>> = OnceLock::new();
+
+/// Install the protected set. Idempotent: the first call wins.
+pub fn protect_paths<I: IntoIterator<Item = PathBuf>>(paths: I) -> &'static [PathBuf] {
+    PROTECTED.get_or_init(|| {
+        paths
+            .into_iter()
+            .map(|path| {
+                std::fs::canonicalize(&path)
+                    .map(|canonical| strip_extended_prefix(&canonical))
+                    .unwrap_or(path)
+            })
+            .collect()
+    })
+}
+
+/// The protected set (empty when nothing was installed).
+pub fn protected_paths() -> &'static [PathBuf] {
+    PROTECTED.get().map(|paths| paths.as_slice()).unwrap_or(&[])
+}
+
+/// Reject a resolved path that is, contains, or sits inside a protected path.
+fn check_protected(real: &Path) -> Result<()> {
+    for protected in protected_paths() {
+        // Both directions matter: reading/writing the file itself and
+        // deleting/renaming one of its ancestors.
+        if path_starts_with(real, protected) || path_starts_with(protected, real) {
+            tracing::warn!(
+                target: "rt_core::pathscope",
+                resolved = %real.display(),
+                protected = %protected.display(),
+                "remote access to a server control path rejected"
+            );
+            return Err(RtError::PolicyDenied(format!(
+                "`{}` is a server control path and cannot be accessed remotely",
+                real.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,6 +580,29 @@ mod tests {
         );
         let long = format!("C:\\{}", "a".repeat(300));
         assert!(to_extended(Path::new(&long)).to_string_lossy().starts_with("\\\\?\\"));
+    }
+
+    #[test]
+    fn protected_control_paths_are_unreachable() {
+        let base = std::env::temp_dir().join(format!("rt_protect_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("tls")).expect("mkdir");
+        std::fs::write(base.join("config.toml"), b"cfg").expect("write");
+        std::fs::write(base.join("tls/server.key.pem"), b"key").expect("write");
+        protect_paths([base.join("config.toml"), base.join("tls")]);
+
+        let guard = PathGuard::new(Scope::Full, None).expect("guard");
+        let config = base.join("config.toml");
+        let key = base.join("tls/server.key.pem");
+        assert!(guard.resolve(&config.to_string_lossy()).is_err());
+        assert!(guard.resolve(&key.to_string_lossy()).is_err());
+        // The containing directory of a protected path is reachable as a
+        // directory but cannot be deleted or renamed through the guard.
+        assert!(guard.resolve(&base.join("tls").to_string_lossy()).is_err());
+        assert!(guard.resolve(&base.to_string_lossy()).is_err());
+        // Everything else keeps working.
+        assert!(guard.resolve(&base.join("other.txt").to_string_lossy()).is_ok());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
