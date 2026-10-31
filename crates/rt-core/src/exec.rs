@@ -1272,4 +1272,15 @@ mod tests {
         assert_eq!(result.exit_code, 0);
         assert!(result.stdout.contains("from stdin"));
     }
+
+    #[test]
+    fn environment_overrides_reach_the_child() {
+        let mut req = ExecRequest::new(ShellKind::Cmd, "echo %RT_EXEC_ENV_VALUE%");
+        req.env
+            .insert("RT_EXEC_ENV_VALUE".to_string(), "hello-env".to_string());
+
+        let result = run(&guard(), &req, &limits()).expect("run");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout.trim(), "hello-env");
+    }
 }
