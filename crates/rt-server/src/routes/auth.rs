@@ -46,7 +46,7 @@ pub(crate) async fn login(
         state.record_audit(
             AuditEvent::new("auth.login", "locked")
                 .user(body.username.clone())
-                .remote(client.ip.clone())
+                .remote(client.remote())
                 .detail(message.clone())
                 .request_id(request_id.clone()),
         );
@@ -72,7 +72,7 @@ pub(crate) async fn login(
             state.record_audit(
                 AuditEvent::new("auth.login", "failure")
                     .user(body.username.clone())
-                    .remote(client.ip.clone())
+                    .remote(client.remote())
                     .target(body.username.clone())
                     .detail(err.public_message())
                     .request_id(request_id.clone()),
@@ -100,7 +100,7 @@ pub(crate) async fn login(
         scope,
         AuthKind::Password,
         body.device_name.clone(),
-        Some(client.ip.clone()),
+        Some(client.remote()),
     );
     let expires_in_secs = session.expires_in_secs(auth::now_ms());
 
@@ -108,7 +108,7 @@ pub(crate) async fn login(
         AuditEvent::new("auth.login", "success")
             .user(username.clone())
             .scope(scope.as_str())
-            .remote(client.ip.clone())
+            .remote(client.remote())
             .detail(format!("device={}", body.device_name.as_deref().unwrap_or("-")))
             .request_id(request_id.clone()),
     );

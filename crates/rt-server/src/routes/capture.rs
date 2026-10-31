@@ -16,7 +16,9 @@ use rt_protocol::{
 };
 use serde::Deserialize;
 
-use crate::middleware::{blocking, json_body, req_id, session_of, ApiErr, ApiQuery, ApiResult};
+use crate::middleware::{
+    blocking, json_body, req_id, require_full_scope, session_of, ApiErr, ApiQuery, ApiResult,
+};
 use crate::state::AppState;
 
 use super::auth::json_limit;
@@ -51,7 +53,8 @@ pub(crate) async fn windows(
     State(_state): State<Arc<AppState>>,
     req: Request,
 ) -> ApiResult<Json<WindowListResponse>> {
-    let _ctx = session_of(&req)?;
+    let ctx = session_of(&req)?;
+    require_full_scope(&ctx, "listing windows")?;
     let windows = blocking(rt_core::capture::list_windows).await?;
     Ok(Json(WindowListResponse {
         windows,
@@ -66,6 +69,8 @@ pub(crate) async fn capture(
     req: Request,
 ) -> ApiResult<Json<CaptureResponse>> {
     let ctx = session_of(&req)?;
+    // Screen pixels are outside the workspace jail, so this needs full scope.
+    require_full_scope(&ctx, "capturing the screen")?;
     let request_id = req_id(&req);
     let cfg = state.config();
     let body: CaptureRequest = json_body(req, json_limit(&cfg.server.max_json_kb)).await?;
@@ -90,6 +95,8 @@ pub(crate) async fn raw(
     req: Request,
 ) -> ApiResult<Response> {
     let ctx = session_of(&req)?;
+    // Screen pixels are outside the workspace jail, so this needs full scope.
+    require_full_scope(&ctx, "capturing the screen")?;
     let request_id = req_id(&req);
 
     let target = parse_target(query.target.as_deref().unwrap_or("primary"))?;

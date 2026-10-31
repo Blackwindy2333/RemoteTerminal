@@ -14,6 +14,12 @@ use axum::serve::Listener;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
+/// How long a peer may take to complete the TLS handshake.
+///
+/// Without this bound one idle TCP connection that never sends a ClientHello
+/// would stall the accept loop, so any remote scanner could deny service.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// `Listener` that upgrades every accepted TCP stream to TLS first.
 pub(crate) struct TlsListener {
     inner: TcpListener,
@@ -44,10 +50,15 @@ impl Listener for TlsListener {
                 }
             };
 
-            match self.acceptor.accept(stream).await {
-                Ok(tls) => return (tls, addr),
-                Err(err) => {
+            // A peer that never finishes the handshake must not hold the loop:
+            // time out, drop the socket and keep accepting (S-05).
+            match tokio::time::timeout(HANDSHAKE_TIMEOUT, self.acceptor.accept(stream)).await {
+                Ok(Ok(tls)) => return (tls, addr),
+                Ok(Err(err)) => {
                     tracing::debug!(target: "tls", peer = %addr, "tls handshake failed: {err}");
+                }
+                Err(_) => {
+                    tracing::debug!(target: "tls", peer = %addr, "tls handshake timed out");
                 }
             }
         }

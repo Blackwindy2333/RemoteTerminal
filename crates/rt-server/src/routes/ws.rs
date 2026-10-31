@@ -6,6 +6,7 @@
 //! the socket closes.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,7 +15,7 @@ use axum::extract::{FromRequestParts, Request, State};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::sync::mpsc::{self, error::TrySendError, unbounded_channel};
 use tokio::task::JoinHandle;
 
 use rt_core::exec::{self, ExecControl, ExecEvent};
@@ -33,10 +34,96 @@ const TAIL_BYTES: usize = 2000;
 /// Default width cap for WebSocket capture previews.
 const WS_CAPTURE_MAX_WIDTH: u32 = 1280;
 
+/// Frames buffered per socket before the server starts dropping them.
+///
+/// The socket feed must stay bounded: a client that stops reading would
+/// otherwise grow server memory without limit. Dropped frames are counted and
+/// reported to the client as soon as the queue catches up.
+const WS_OUTBOUND_CAPACITY: usize = 256;
+
 /// One running client-requested stream.
 struct StreamTask {
     control: Option<ExecControl>,
     handle: JoinHandle<()>,
+}
+
+/// What happened to a frame handed to the outbound queue.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Queued {
+    /// The frame is waiting for the writer task.
+    Sent,
+    /// The queue was full and the frame was dropped to bound memory.
+    Dropped,
+    /// The peer is gone, so the producing stream can stop.
+    Closed,
+}
+
+/// Bounded, cloneable handle to one socket's outbound frame queue.
+#[derive(Clone)]
+struct Outbound {
+    tx: mpsc::Sender<WsServerMessage>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl Outbound {
+    /// Creates the queue and the receiver drained by the socket writer task.
+    fn channel(capacity: usize) -> (Self, mpsc::Receiver<WsServerMessage>) {
+        let (tx, rx) = mpsc::channel(capacity.max(1));
+        (
+            Self {
+                tx,
+                dropped: Arc::new(AtomicU64::new(0)),
+            },
+            rx,
+        )
+    }
+
+    /// Queues a frame without ever blocking the producer.
+    fn send(&self, message: WsServerMessage) -> Queued {
+        match self.tx.try_send(message) {
+            Ok(()) => Queued::Sent,
+            Err(TrySendError::Full(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                Queued::Dropped
+            }
+            Err(TrySendError::Closed(_)) => Queued::Closed,
+        }
+    }
+
+    /// Returns how many frames were dropped since the previous call.
+    fn take_dropped(&self) -> u64 {
+        self.dropped.swap(0, Ordering::Relaxed)
+    }
+}
+
+/// Error frame used when a stream needs more scope than the session has.
+fn scope_error(what: &str) -> RtError {
+    RtError::Forbidden(format!(
+        "{what} requires the full scope; this session is limited to the workspace"
+    ))
+}
+
+/// Serialises one server message into the socket.
+async fn write_frame(
+    sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    message: &WsServerMessage,
+) -> Result<(), ()> {
+    let Ok(text) = serde_json::to_string(message) else {
+        return Ok(());
+    };
+    sink.send(Message::Text(text.into()))
+        .await
+        .map_err(|_| ())
+}
+
+/// Notice telling the client how many frames the server had to drop.
+fn drop_notice(dropped: u64) -> WsServerMessage {
+    WsServerMessage::error(
+        None,
+        api_detail(RtError::Unavailable(format!(
+            "dropped {dropped} frame(s) because this client stopped reading"
+        ))),
+    )
 }
 
 /// `GET /api/v1/ws?ticket=` — validates the ticket, then upgrades.
@@ -75,7 +162,7 @@ fn ticket_from_query(query: &str) -> String {
 
 /// Drives one socket until either side closes it.
 async fn run_socket(state: Arc<AppState>, ctx: SessionContext, socket: WebSocket) {
-    let (out_tx, mut out_rx) = unbounded_channel::<WsServerMessage>();
+    let (out, mut out_rx) = Outbound::channel(WS_OUTBOUND_CAPACITY);
     let (mut sink, mut stream) = socket.split();
 
     state.record_audit(
@@ -87,12 +174,14 @@ async fn run_socket(state: Arc<AppState>, ctx: SessionContext, socket: WebSocket
     );
     tracing::info!(target: "ws", user = %ctx.username, scope = %ctx.scope.as_str(), "websocket connected");
 
+    let writer_out = out.clone();
     let writer = tokio::spawn(async move {
         while let Some(message) = out_rx.recv().await {
-            let Ok(text) = serde_json::to_string(&message) else {
-                continue;
-            };
-            if sink.send(Message::Text(text.into())).await.is_err() {
+            if write_frame(&mut sink, &message).await.is_err() {
+                break;
+            }
+            let dropped = writer_out.take_dropped();
+            if dropped > 0 && write_frame(&mut sink, &drop_notice(dropped)).await.is_err() {
                 break;
             }
         }
@@ -106,7 +195,7 @@ async fn run_socket(state: Arc<AppState>, ctx: SessionContext, socket: WebSocket
             Ok(Message::Binary(bytes)) => match String::from_utf8(bytes.to_vec()) {
                 Ok(text) => text,
                 Err(_) => {
-                    send_error(&out_tx, None, RtError::bad_request("binary frames must be UTF-8 JSON"));
+                    send_error(&out, None, RtError::bad_request("binary frames must be UTF-8 JSON"));
                     continue;
                 }
             },
@@ -122,7 +211,7 @@ async fn run_socket(state: Arc<AppState>, ctx: SessionContext, socket: WebSocket
             Ok(message) => message,
             Err(err) => {
                 send_error(
-                    &out_tx,
+                    &out,
                     None,
                     RtError::bad_request(format!("invalid client message: {err}")),
                 );
@@ -136,13 +225,18 @@ async fn run_socket(state: Arc<AppState>, ctx: SessionContext, socket: WebSocket
 
         match message {
             WsClientMessage::Ping { id } => {
-                let _ = out_tx.send(WsServerMessage::Pong { id });
+                let _ = out.send(WsServerMessage::Pong { id });
             }
 
             WsClientMessage::Exec { id, request } => {
+                // Running an arbitrary process would bypass the path jail.
+                if !ctx.scope.is_full() {
+                    send_error(&out, Some(id), scope_error("executing commands"));
+                    continue;
+                }
                 if tasks.contains_key(&id) {
                     send_error(
-                        &out_tx,
+                        &out,
                         Some(id),
                         RtError::Conflict(format!("id {id} is already in use")),
                     );
@@ -150,13 +244,13 @@ async fn run_socket(state: Arc<AppState>, ctx: SessionContext, socket: WebSocket
                 }
                 if tasks.len() >= WS_MAX_CONCURRENT_STREAMS as usize {
                     send_error(
-                        &out_tx,
+                        &out,
                         Some(id),
                         RtError::Unavailable("too many concurrent streams on this socket".into()),
                     );
                     continue;
                 }
-                match start_exec(&state, &ctx, id, request, &out_tx) {
+                match start_exec(&state, &ctx, id, request, &out) {
                     Ok((control, handle)) => {
                         tasks.insert(
                             id,
@@ -166,7 +260,7 @@ async fn run_socket(state: Arc<AppState>, ctx: SessionContext, socket: WebSocket
                             },
                         );
                     }
-                    Err(err) => send_error(&out_tx, Some(id), err),
+                    Err(err) => send_error(&out, Some(id), err),
                 }
             }
 
@@ -175,13 +269,13 @@ async fn run_socket(state: Arc<AppState>, ctx: SessionContext, socket: WebSocket
                     if let Some(control) = &task.control {
                         control.cancel();
                     }
-                    let _ = out_tx.send(WsServerMessage::Accepted {
+                    let _ = out.send(WsServerMessage::Accepted {
                         id,
                         detail: Some("cancellation requested".to_string()),
                     });
                 }
                 None => {
-                    let _ = out_tx.send(WsServerMessage::Accepted {
+                    let _ = out.send(WsServerMessage::Accepted {
                         id,
                         detail: Some("no running stream with that id".to_string()),
                     });
@@ -196,7 +290,7 @@ async fn run_socket(state: Arc<AppState>, ctx: SessionContext, socket: WebSocket
             } => {
                 if tasks.contains_key(&id) {
                     send_error(
-                        &out_tx,
+                        &out,
                         Some(id),
                         RtError::Conflict(format!("id {id} is already in use")),
                     );
@@ -204,13 +298,18 @@ async fn run_socket(state: Arc<AppState>, ctx: SessionContext, socket: WebSocket
                 }
                 if tasks.len() >= WS_MAX_CONCURRENT_STREAMS as usize {
                     send_error(
-                        &out_tx,
+                        &out,
                         Some(id),
                         RtError::Unavailable("too many concurrent streams on this socket".into()),
                     );
                     continue;
                 }
-                let handle = start_capture(&state, id, request, fps, max_frames, &out_tx);
+                // Screen pixels are outside the workspace jail.
+                if !ctx.scope.is_full() {
+                    send_error(&out, Some(id), scope_error("capturing the screen"));
+                    continue;
+                }
+                let handle = start_capture(&state, id, request, fps, max_frames, &out);
                 tasks.insert(
                     id,
                     StreamTask {
@@ -218,23 +317,28 @@ async fn run_socket(state: Arc<AppState>, ctx: SessionContext, socket: WebSocket
                         handle,
                     },
                 );
-                let _ = out_tx.send(WsServerMessage::Accepted {
+                let _ = out.send(WsServerMessage::Accepted {
                     id,
                     detail: Some("capture stream started".to_string()),
                 });
             }
 
             WsClientMessage::SubscribeLogs { id, level, backlog } => {
+                // The REST tail is full-scope only; the socket must not differ.
+                if !ctx.scope.is_full() {
+                    send_error(&out, Some(id), scope_error("streaming logs"));
+                    continue;
+                }
                 tasks.retain(|_, task| !task.handle.is_finished());
                 if tasks.len() >= WS_MAX_CONCURRENT_STREAMS as usize {
                     send_error(
-                        &out_tx,
+                        &out,
                         Some(id),
                         RtError::Unavailable("too many concurrent streams on this socket".into()),
                     );
                     continue;
                 }
-                let handle = start_logs(&state, id, level.clone(), backlog, &out_tx);
+                let handle = start_logs(&state, id, level.clone(), backlog, &out);
                 tasks.insert(
                     id,
                     StreamTask {
@@ -242,7 +346,7 @@ async fn run_socket(state: Arc<AppState>, ctx: SessionContext, socket: WebSocket
                         handle,
                     },
                 );
-                let _ = out_tx.send(WsServerMessage::Accepted {
+                let _ = out.send(WsServerMessage::Accepted {
                     id,
                     detail: Some(format!("streaming logs since level {:?}", level)),
                 });
@@ -252,13 +356,13 @@ async fn run_socket(state: Arc<AppState>, ctx: SessionContext, socket: WebSocket
                 tasks.retain(|_, task| !task.handle.is_finished());
                 if tasks.len() >= WS_MAX_CONCURRENT_STREAMS as usize {
                     send_error(
-                        &out_tx,
+                        &out,
                         Some(id),
                         RtError::Unavailable("too many concurrent streams on this socket".into()),
                     );
                     continue;
                 }
-                let handle = start_status(&state, id, fps, &out_tx);
+                let handle = start_status(&state, id, fps, &out);
                 tasks.insert(
                     id,
                     StreamTask {
@@ -266,7 +370,7 @@ async fn run_socket(state: Arc<AppState>, ctx: SessionContext, socket: WebSocket
                         handle,
                     },
                 );
-                let _ = out_tx.send(WsServerMessage::Accepted {
+                let _ = out.send(WsServerMessage::Accepted {
                     id,
                     detail: Some(format!("streaming status at {fps} fps")),
                 });
@@ -279,7 +383,7 @@ async fn run_socket(state: Arc<AppState>, ctx: SessionContext, socket: WebSocket
                     }
                     task.handle.abort();
                 }
-                let _ = out_tx.send(WsServerMessage::Unsubscribed { id });
+                let _ = out.send(WsServerMessage::Unsubscribed { id });
             }
         }
     }
@@ -291,7 +395,7 @@ async fn run_socket(state: Arc<AppState>, ctx: SessionContext, socket: WebSocket
         }
         task.handle.abort();
     }
-    drop(out_tx);
+    drop(out);
     let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
 
     state.record_audit(
@@ -305,7 +409,7 @@ async fn run_socket(state: Arc<AppState>, ctx: SessionContext, socket: WebSocket
 }
 
 /// Queues one error frame; ignores send failures (the peer is gone anyway).
-fn send_error(out: &UnboundedSender<WsServerMessage>, id: Option<u64>, err: RtError) {
+fn send_error(out: &Outbound, id: Option<u64>, err: RtError) {
     let _ = out.send(WsServerMessage::error(id, api_detail(err)));
 }
 
@@ -315,7 +419,7 @@ fn start_exec(
     ctx: &SessionContext,
     id: u64,
     request: ExecRequest,
-    out: &UnboundedSender<WsServerMessage>,
+    out: &Outbound,
 ) -> Result<(ExecControl, JoinHandle<()>), RtError> {
     if let Err(message) = request.validate() {
         return Err(RtError::bad_request(message));
@@ -445,7 +549,7 @@ fn start_capture(
     request: rt_protocol::CaptureRequest,
     fps: u8,
     max_frames: Option<u32>,
-    out: &UnboundedSender<WsServerMessage>,
+    out: &Outbound,
 ) -> JoinHandle<()> {
     let max_fps = state.cfg().server.capture_max_fps.max(1);
     let effective = fps.max(1).min(max_fps);
@@ -476,10 +580,7 @@ fn start_capture(
             match capture {
                 Ok(Ok(frame)) => {
                     seq += 1;
-                    if out
-                        .send(WsServerMessage::CaptureFrame { id, frame })
-                        .is_err()
-                    {
+                    if out.send(WsServerMessage::CaptureFrame { id, frame }) == Queued::Closed {
                         return;
                     }
                     if let Some(limit) = max_frames {
@@ -526,7 +627,7 @@ fn start_logs(
     id: u64,
     level: Option<String>,
     backlog: u32,
-    out: &UnboundedSender<WsServerMessage>,
+    out: &Outbound,
 ) -> JoinHandle<()> {
     let sink = state.sink();
     let mut receiver = sink.subscribe();
@@ -538,10 +639,7 @@ fn start_logs(
             if !level_matches(&event.level, level.as_deref()) {
                 continue;
             }
-            if out
-                .send(WsServerMessage::Log { id, event })
-                .is_err()
-            {
+            if out.send(WsServerMessage::Log { id, event }) == Queued::Closed {
                 return;
             }
         }
@@ -551,7 +649,7 @@ fn start_logs(
                     if !level_matches(&event.level, level.as_deref()) {
                         continue;
                     }
-                    if out.send(WsServerMessage::Log { id, event }).is_err() {
+                    if out.send(WsServerMessage::Log { id, event }) == Queued::Closed {
                         return;
                     }
                 }
@@ -567,7 +665,7 @@ fn start_status(
     state: &Arc<AppState>,
     id: u64,
     fps: u8,
-    out: &UnboundedSender<WsServerMessage>,
+    out: &Outbound,
 ) -> JoinHandle<()> {
     let max_fps = state.cfg().server.status_max_fps.max(1);
     let effective = fps.max(1).min(max_fps);
@@ -585,7 +683,7 @@ fn start_status(
             let sample = tokio::task::spawn_blocking(move || service.quick(active)).await;
             match sample {
                 Ok(Ok(status)) => {
-                    if out.send(WsServerMessage::Status { id, status }).is_err() {
+                    if out.send(WsServerMessage::Status { id, status }) == Queued::Closed {
                         return;
                     }
                 }
@@ -608,7 +706,7 @@ fn start_status(
 
 /// Forward one execution event to the client.
 fn forward_event(
-    out: &UnboundedSender<WsServerMessage>,
+    out: &Outbound,
     id: u64,
     seq: &mut u64,
     event: ExecEvent,

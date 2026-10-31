@@ -121,6 +121,23 @@ pub async fn serve(
         server.bind.trim().to_string()
     };
 
+    // Refuse to listen on a configuration that cannot work (S-04). `port = 0`
+    // means "let the OS pick a free port" — supported for tests and embedded
+    // use — which the shared validator rejects, so probe with the default port.
+    let mut probe = config.clone();
+    if probe.server.port == 0 {
+        probe.server.port = 46666;
+    }
+    let report = probe.validate();
+    for warning in &report.warnings {
+        tracing::warn!(target: "server", "configuration: {warning}");
+    }
+    if !report.errors.is_empty() {
+        return Err(anyhow::Error::new(rt_core::RtError::Config(
+            report.errors.join("; "),
+        )));
+    }
+
     let addr = format!("{bind}:{}", server.port);
     let listener = TcpListener::bind(&addr)
         .await

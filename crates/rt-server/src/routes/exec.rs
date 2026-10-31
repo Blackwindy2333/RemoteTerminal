@@ -8,12 +8,17 @@ use rt_core::exec::{self, ExecLimits};
 use rt_protocol::error::ErrorCode;
 use rt_protocol::{ExecRequest, ExecResult, ShellListResponse};
 
-use crate::middleware::{blocking, json_body, req_id, session_of, ApiErr, ApiResult};
+use crate::middleware::{
+    blocking, json_body, req_id, require_full_scope, session_of, ApiErr, ApiResult,
+};
 use crate::state::AppState;
 
 use super::auth::json_limit;
 
 /// `GET /api/v1/exec/shells` — which shells this host can run.
+///
+/// Discovery is harmless, so workspace sessions may call it; running a command
+/// is full-scope only.
 pub(crate) async fn shells() -> ApiResult<Json<ShellListResponse>> {
     Ok(Json(blocking(exec::available_shells).await?))
 }
@@ -24,6 +29,9 @@ pub(crate) async fn run(
     req: Request,
 ) -> ApiResult<Json<ExecResult>> {
     let ctx = session_of(&req)?;
+    // A workspace session must not reach arbitrary processes: that would be a
+    // full-disk remote code execution bypass of the path jail.
+    require_full_scope(&ctx, "executing commands")?;
     let request_id = req_id(&req);
     let cfg = state.config();
     let body: ExecRequest = json_body(req, json_limit(&cfg.server.max_json_kb)).await?;

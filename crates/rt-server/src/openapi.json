@@ -154,7 +154,7 @@
     "/api/v1/exec": {
       "post": {
         "tags": ["exec"],
-        "summary": "Run one command and wait for it",
+        "summary": "Run one command and wait for it (full scope only)",
         "requestBody": {
           "required": true,
           "content": {
@@ -471,21 +471,22 @@
     "/api/v1/capture/windows": {
       "get": {
         "tags": ["capture"],
-        "summary": "List capturable windows",
+        "summary": "List capturable windows (full scope only)",
         "responses": {
           "200": {
             "description": "Windows",
             "content": {
               "application/json": { "schema": { "$ref": "#/components/schemas/WindowListResponse" } }
             }
-          }
+          },
+          "403": { "$ref": "#/components/responses/Forbidden" }
         }
       }
     },
     "/api/v1/capture": {
       "post": {
         "tags": ["capture"],
-        "summary": "Capture as base64 JSON",
+        "summary": "Capture as base64 JSON (full scope only)",
         "requestBody": {
           "required": true,
           "content": {
@@ -500,6 +501,7 @@
             }
           },
           "400": { "$ref": "#/components/responses/BadRequest" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" },
           "503": { "$ref": "#/components/responses/Unavailable" }
         }
@@ -508,7 +510,7 @@
     "/api/v1/capture/raw": {
       "get": {
         "tags": ["capture"],
-        "summary": "Capture as raw image bytes (usable in <img src>)",
+        "summary": "Capture as raw image bytes (usable in <img src>; full scope only)",
         "parameters": [
           {
             "name": "target",
@@ -534,6 +536,7 @@
             }
           },
           "400": { "$ref": "#/components/responses/BadRequest" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" }
         }
       }
@@ -618,7 +621,12 @@
     "responses": {
       "BadRequest": { "$ref": "#/components/responses/Envelope" },
       "Unauthorized": { "$ref": "#/components/responses/Envelope" },
-      "Forbidden": { "$ref": "#/components/responses/Envelope" },
+      "Forbidden": {
+        "description": "The session lacks the scope this endpoint needs (for example exec, capture and log inspection require the full scope)",
+        "content": {
+          "application/json": { "schema": { "$ref": "#/components/schemas/ApiErrorBody" } }
+        }
+      },
       "NotFound": { "$ref": "#/components/responses/Envelope" },
       "Conflict": { "$ref": "#/components/responses/Envelope" },
       "Locked": { "$ref": "#/components/responses/Envelope" },
