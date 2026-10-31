@@ -231,10 +231,10 @@ pub fn run_streaming(
     guard: &PathGuard,
     req: &ExecRequest,
     limits: &ExecLimits,
-    control: &ExecControl,
+    control: ExecControl,
     sink: &mut dyn FnMut(ExecEvent),
 ) -> Result<ExecResult> {
-    let (result, _cancelled) = execute(guard, req, limits, control, sink, Mode::Stream)?;
+    let (result, _cancelled) = execute(guard, req, limits, &control, sink, Mode::Stream)?;
     Ok(result)
 }
 
@@ -245,10 +245,10 @@ pub fn run_summary(
     guard: &PathGuard,
     req: &ExecRequest,
     limits: &ExecLimits,
-    control: &ExecControl,
+    control: ExecControl,
     sink: &mut dyn FnMut(ExecEvent),
 ) -> Result<ExecSummary> {
-    let (result, cancelled) = execute(guard, req, limits, control, sink, Mode::Summary)?;
+    let (result, cancelled) = execute(guard, req, limits, &control, sink, Mode::Summary)?;
     Ok(ExecSummary {
         exit_code: result.exit_code,
         duration_ms: result.duration_ms,
@@ -267,12 +267,12 @@ pub fn run_summary(
 /// the lifetime of the process (and the probe budget is kept well under 3s).
 /// Failures never bubble up: an unavailable shell is reported with
 /// `available = false` and no version.
-pub fn available_shells() -> ShellListResponse {
+pub fn available_shells() -> Result<ShellListResponse> {
     let shells = SHELL_CACHE.get_or_init(probe_shells).clone();
-    ShellListResponse {
+    Ok(ShellListResponse {
         default_shell: default_shell(&shells),
         shells,
-    }
+    })
 }
 
 /// Validates and normalises a request before execution.
@@ -1086,7 +1086,7 @@ mod tests {
         });
 
         let started = Instant::now();
-        let summary = run_summary(&guard(), &req, &limits(), &control, &mut |_| {})
+        let summary = run_summary(&guard(), &req, &limits(), control.clone(), &mut |_| {})
             .expect("run_summary");
         worker.join().expect("cancel thread");
 
@@ -1107,7 +1107,7 @@ mod tests {
                 &guard(),
                 &req,
                 &limits(),
-                &ExecControl::new(),
+                ExecControl::new(),
                 &mut sink,
             )
         }
@@ -1168,7 +1168,7 @@ mod tests {
 
     #[test]
     fn available_shells_always_include_cmd() {
-        let list = available_shells();
+        let list = available_shells().expect("shell list");
         assert_eq!(list.shells.len(), 3);
         let cmd = list
             .shells
@@ -1179,7 +1179,7 @@ mod tests {
         assert!(cmd.path.as_deref().is_some_and(|p| p.to_lowercase().ends_with("cmd.exe")));
 
         // Cached: a second call must agree with the first.
-        let again = available_shells();
+        let again = available_shells().expect("cached shell list");
         assert_eq!(again.shells.len(), 3);
         assert!(list.default_shell.is_some());
     }
