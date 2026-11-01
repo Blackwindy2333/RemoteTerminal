@@ -626,6 +626,9 @@ fn delete_one(
     even_if_readonly: bool,
 ) -> Result<String> {
     let real = guard.resolve(path)?;
+    // A directory that merely *contains* a control path resolves fine, but
+    // deleting it would take `config.toml` (or the TLS key) with it.
+    pathscope::check_protected_subtree(&real)?;
     ensure_deletable(guard, &real)?;
     // `delete` cannot hold the handle it removes through, so the entry is
     // re-verified immediately before each syscall; the residual window is the
@@ -750,6 +753,8 @@ fn remove_children(guard: &PathGuard, dir: &Path, clear_ro: bool) -> Result<()> 
 pub fn rename(guard: &PathGuard, req: &RenameRequest) -> Result<()> {
     let from = guard.resolve(&req.from)?;
     let to = guard.resolve(&req.to)?;
+    // Moving a directory away would drag any control path inside it along.
+    pathscope::check_protected_subtree(&from)?;
     if pathscope::path_eq(&from, &to) {
         // Same file (a case-only rename is indistinguishable after
         // canonicalisation); nothing to move.
@@ -865,6 +870,10 @@ fn copy_with_caps(guard: &PathGuard, req: &CopyRequest, caps: CopyCaps) -> Resul
     let started = Instant::now();
     let from = guard.resolve(&req.from)?;
     let to = guard.resolve(&req.to)?;
+    // Copying a directory tree that holds a control path would duplicate
+    // `config.toml` (password hashes) or the TLS private key somewhere the
+    // session can read it.
+    pathscope::check_protected_subtree(&from)?;
     if pathscope::path_eq(&from, &to) {
         return Err(RtError::BadRequest(format!(
             "`{}` is both source and destination",

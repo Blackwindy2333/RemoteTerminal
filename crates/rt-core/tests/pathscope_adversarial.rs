@@ -689,3 +689,124 @@ fn symlink_or_junction_escape_is_blocked() {
         expect_rejected_or_contained(&jail, "escape\\..\\..\\..\\Windows\\win.ini");
     }
 }
+
+// ---------------------------------------------------------------------------
+// S-08 follow-up: the control-file denylist must also survive *indirect* paths
+// ---------------------------------------------------------------------------
+
+/// The denylist protects `config.toml` and the TLS key from being read or
+/// overwritten, but a session could still reach them indirectly: delete the
+/// install directory recursively, move it elsewhere, or copy the tree (which
+/// duplicates the password hashes and the private key somewhere readable).
+///
+/// `protect_paths` is a process-wide `OnceLock`, which is why this lives in its
+/// own integration binary instead of in the `pathscope` unit tests.
+#[test]
+fn control_paths_cannot_be_reached_through_a_parent_operation() {
+    use rt_core::fsops;
+    use rt_core::pathscope::{check_protected_subtree, protect_paths};
+    use rt_core::RtError;
+    use rt_protocol::{CopyRequest, DeleteRequest, RenameRequest};
+
+    let dir = tempfile::tempdir().expect("temp install dir");
+    let base = plain(&std::fs::canonicalize(dir.path()).expect("canonical base"));
+    let out = tempfile::tempdir().expect("temp destination dir");
+    std::fs::create_dir_all(base.join("tls")).expect("create tls");
+    std::fs::create_dir_all(base.join("work")).expect("create work");
+    std::fs::write(
+        base.join("config.toml"),
+        b"password_hash = \"$argon2id$v=19$...\"",
+    )
+    .expect("write");
+    std::fs::write(base.join("tls").join("server.key.pem"), b"PRIVATE").expect("write key");
+
+    protect_paths([base.join("config.toml"), base.join("tls")]);
+
+    let guard = PathGuard::new(Scope::Full, None).expect("full guard");
+    let shown = |path: &Path| path.to_string_lossy().into_owned();
+
+    // Direct access stays refused, including through the protected directory.
+    assert!(guard.resolve(&shown(&base.join("config.toml"))).is_err());
+    assert!(guard.resolve(&shown(&base.join("tls"))).is_err());
+    assert!(guard.resolve(&shown(&base.join("tls").join("server.key.pem"))).is_err());
+
+    // Reading *around* the control files keeps working: the install directory
+    // is listable, and so is a sibling subtree and a drive root.
+    assert!(guard.resolve(&shown(&base)).is_ok());
+    assert!(guard.resolve(&shown(&base.join("work"))).is_ok());
+
+    // …but the operations that would carry the control files away are refused.
+    assert!(check_protected_subtree(&base).is_err());
+    assert!(check_protected_subtree(&base.join("work")).is_ok());
+
+    let denied = |err: RtError, what: &str| {
+        assert!(
+            matches!(err, RtError::PolicyDenied(_)),
+            "{what} must be refused as a policy violation, got {err:?}"
+        );
+    };
+
+    let delete = fsops::delete(
+        &guard,
+        &DeleteRequest {
+            paths: vec![shown(&base)],
+            recursive: true,
+            even_if_readonly: true,
+        },
+    )
+    .expect("delete reports per-path failures instead of erroring");
+    assert!(delete.deleted.is_empty(), "nothing may be deleted");
+    assert_eq!(delete.failed.len(), 1, "exactly one path is reported failed");
+    assert!(
+        delete.failed[0].message.contains("server control path"),
+        "unexpected message: {}",
+        delete.failed[0].message
+    );
+    assert!(base.join("config.toml").exists(), "config.toml must survive");
+
+    let err = fsops::rename(
+        &guard,
+        &RenameRequest {
+            from: shown(&base),
+            to: shown(&base.with_file_name("moved")),
+            overwrite: true,
+        },
+    )
+    .expect_err("moving the install directory must fail");
+    denied(err, "rename of the install directory");
+    assert!(base.join("config.toml").exists(), "config.toml must survive");
+
+    let elsewhere = plain(
+        &std::fs::canonicalize(out.path()).expect("canonical destination root"),
+    )
+    .join("copy-of-install");
+    let err = fsops::copy(
+        &guard,
+        &CopyRequest {
+            from: shown(&base),
+            to: shown(&elsewhere),
+            overwrite: false,
+            recursive: true,
+        },
+    )
+    .expect_err("copying the install directory must fail");
+    denied(err, "copy of the install directory");
+    assert!(
+        !elsewhere.join("config.toml").exists(),
+        "the copy must not have produced a readable config.toml"
+    );
+
+    // Copying a tree that holds no control file is still allowed.
+    std::fs::write(base.join("work").join("notes.txt"), b"hello").expect("write");
+    let copied = fsops::copy(
+        &guard,
+        &CopyRequest {
+            from: shown(&base.join("work")),
+            to: shown(&elsewhere),
+            overwrite: false,
+            recursive: true,
+        },
+    )
+    .expect("copying an ordinary directory works");
+    assert_eq!(copied.size, 5);
+}

@@ -406,7 +406,7 @@ RemoteTerminal 的**密码学底座与路径监狱实现质量很高**：Argon2i
 | S-05 | HIGH | `7c4df3b` | TLS 握手包在 `tokio::time::timeout(HANDSHAKE_TIMEOUT = 10s)` 里，超时只 `continue`，不阻塞 accept 循环 | 单连接不发 ClientHello 时服务仍可服务新连接 |
 | S-06 | HIGH | `da1ecc8` | CLI 与 MCP 在发凭据前先做一次未认证 `health()` 探针，未固定指纹时**拒绝登录**并打印 `--fingerprint` 指引；MCP 无终端可确认，一律拒绝 | 无 `RT_FINGERPRINT` 的 MCP 调用报 `refusing to send credentials over an unpinned TLS connection …` |
 | S-07 | HIGH | `7c4df3b` + `45f698c` | WS 出口 `mpsc::channel(256)` + `try_send`（丢弃计数、恢复时补发 error 帧）；exec 流式改 `tokio::sync::mpsc::channel(256)`，消费者消失或 1s 投不进即杀进程树 | `dropped_consumer_stops_the_reader_and_kills_the_child`、`stalled_consumer_aborts_the_run_and_reports_cancelled` |
-| S-08 | HIGH | `da1ecc8` | `pathscope` 新增 `PROTECTED` 集合与 `check_protected`（双向前缀判定 → `PolicyDenied`）；`bootstrap::install_control_path_guards` 保护 `config.toml`、`.bak`、`instance.lock`、审计文件、`data/tls` | `protected_control_paths_are_unreachable`；MCP 读 `config.toml` → 403 `policy_denied` |
+| S-08 | HIGH | `da1ecc8` | `pathscope` 新增 `PROTECTED` 集合与 `check_protected`（双向前缀判定 → `PolicyDenied`）；`bootstrap::install_control_path_guards` 保护 `config.toml`、`.bak`、`instance.lock`、审计文件、`data/tls`。**2026-11-01 修正**：改为「只拦受保护路径自身与其子孙」+ 新增 `check_protected_subtree`（`fsops::delete`/`rename`/`copy` 源头调用）—— 原先的双向前缀会把 `C:\` 与安装目录上层的每一级都判死（`C:\` 下必有控制文件），使 Full 会话连磁盘根都打不开；现在读/列目录照常，而「递归删安装目录」「改名搬走」「整树拷贝（会复制密码哈希与私钥）」仍被拒 | `protected_control_paths_are_unreachable`、`control_paths_cannot_be_reached_through_a_parent_operation`；MCP 读 `config.toml` → 403 `policy_denied` |
 
 ### 9.2 MEDIUM
 

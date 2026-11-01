@@ -529,12 +529,16 @@ pub fn protected_paths() -> &'static [PathBuf] {
     PROTECTED.get().map(|paths| paths.as_slice()).unwrap_or(&[])
 }
 
-/// Reject a resolved path that is, contains, or sits inside a protected path.
+/// Reject a resolved path that is one of the protected paths or sits inside one.
 fn check_protected(real: &Path) -> Result<()> {
     for protected in protected_paths() {
-        // Both directions matter: reading/writing the file itself and
-        // deleting/renaming one of its ancestors.
-        if path_starts_with(real, protected) || path_starts_with(protected, real) {
+        // Only one direction: the control path itself and everything below it.
+        // Its *ancestors* stay reachable, otherwise a full-scope session could
+        // not even list the directory that holds `config.toml` — and, worse,
+        // `C:\` would become unresolvable because every control path on that
+        // drive sits under it. Deletion and moves of an ancestor are rejected
+        // separately by [`check_protected_subtree`].
+        if path_starts_with(real, protected) {
             tracing::warn!(
                 target: "rt_core::pathscope",
                 resolved = %real.display(),
@@ -543,6 +547,30 @@ fn check_protected(real: &Path) -> Result<()> {
             );
             return Err(RtError::PolicyDenied(format!(
                 "`{}` is a server control path and cannot be accessed remotely",
+                real.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Reject a resolved path whose subtree contains a protected path.
+///
+/// Resolving an ancestor of `config.toml` is fine for reading and listing, but
+/// deleting or moving that ancestor would take the control file with it
+/// (`remove_dir_all` on the install directory, a rename of `data/`, …). Mutating
+/// entry points call this in addition to [`PathGuard::resolve`].
+pub fn check_protected_subtree(real: &Path) -> Result<()> {
+    for protected in protected_paths() {
+        if path_starts_with(protected, real) {
+            tracing::warn!(
+                target: "rt_core::pathscope",
+                resolved = %real.display(),
+                protected = %protected.display(),
+                "refusing to delete or move a subtree that holds a server control path"
+            );
+            return Err(RtError::PolicyDenied(format!(
+                "`{}` contains a server control path and cannot be deleted or moved remotely",
                 real.display()
             )));
         }
@@ -718,10 +746,16 @@ mod tests {
         let key = base.join("tls/server.key.pem");
         assert!(guard.resolve(&config.to_string_lossy()).is_err());
         assert!(guard.resolve(&key.to_string_lossy()).is_err());
-        // The containing directory of a protected path is reachable as a
-        // directory but cannot be deleted or renamed through the guard.
         assert!(guard.resolve(&base.join("tls").to_string_lossy()).is_err());
-        assert!(guard.resolve(&base.to_string_lossy()).is_err());
+        // The directories *above* a control path stay readable: a session has
+        // to be able to list the install directory, and `C:\` must not become
+        // unreachable just because some control path lives below it.
+        assert!(guard.resolve(&base.to_string_lossy()).is_ok());
+        assert!(guard.resolve("C:\\").is_ok());
+        // Mutations of those ancestors are refused: deleting or moving them
+        // would carry the control files away.
+        assert!(check_protected_subtree(&base).is_err());
+        assert!(check_protected_subtree(&base.join("sub")).is_ok());
         // Everything else keeps working.
         assert!(guard.resolve(&base.join("other.txt").to_string_lossy()).is_ok());
         let _ = std::fs::remove_dir_all(&base);
