@@ -58,12 +58,6 @@ impl ApiErr {
         Self(ApiErrorBody::new(code, message))
     }
 
-    /// Attaches a structured payload (never secrets).
-    pub(crate) fn with_detail(mut self, detail: serde_json::Value) -> Self {
-        self.0 = self.0.with_detail(detail);
-        self
-    }
-
     /// Adds a retry hint for 429/409 style answers.
     pub(crate) fn with_retry_after(mut self, secs: u64) -> Self {
         self.0 = self.0.with_retry_after(secs);
@@ -327,7 +321,9 @@ pub(crate) async fn auth_layer(
             session.scope,
             session.auth_kind.as_str(),
         ),
-        None => match auth::verify_api_key(&cfg.server.api_keys, &token) {
+        // API keys are read from the live credential snapshot so revoking one
+        // in `config.toml` takes effect without a restart (SECURITY.md S-14).
+        None => match auth::verify_api_key(&state.credentials().api_keys, &token) {
             Some((name, scope)) => SessionContext::new(name, scope, crate::state::AUTH_KIND_API_KEY),
             None => {
                 return error_response(
@@ -362,6 +358,11 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
 }
 
 /// Resolves the caller address once per request.
+///
+/// `X-Forwarded-For` is honoured only when the connection itself comes from a
+/// loopback or private proxy, so a client behind an untrusted hop cannot forge
+/// its own address into the allow-list, the throttles or the audit trail
+/// (SECURITY.md S-11).
 pub(crate) fn client_info(req: &Request, cfg: &rt_core::config::Config) -> ClientInfo {
     let addr = req
         .extensions()
@@ -373,13 +374,18 @@ pub(crate) fn client_info(req: &Request, cfg: &rt_core::config::Config) -> Clien
                 .map(|info| info.0)
         });
 
-    // A reverse proxy (when explicitly trusted) is authoritative.
     if cfg.server.trust_forwarded_for {
-        if let Some(ip) = forwarded_ip(req.headers()) {
-            return ClientInfo {
-                addr,
-                ip: auth::normalise_ip(&ip.to_string()),
-            };
+        if let Some(peer) = addr.map(|addr| addr.ip()) {
+            if is_trusted_proxy(peer) {
+                if let Some(ip) = forwarded_ip(req.headers()) {
+                    return ClientInfo {
+                        addr,
+                        ip: auth::normalise_ip(&ip.to_string()),
+                    };
+                }
+            } else if has_forwarded_header(req.headers()) {
+                warn_untrusted_forwarded(peer);
+            }
         }
     }
 
@@ -390,6 +396,54 @@ pub(crate) fn client_info(req: &Request, cfg: &rt_core::config::Config) -> Clien
         None => "unknown".to_string(),
     };
     ClientInfo { addr, ip }
+}
+
+/// Reverse proxies are expected to be local (loopback) or on a private hop.
+fn is_trusted_proxy(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                return true;
+            }
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return mapped.is_loopback() || mapped.is_private() || mapped.is_link_local();
+            }
+            // Unique local addresses fc00::/7.
+            (v6.segments()[0] & 0xfe00) == 0xfc00
+        }
+    }
+}
+
+fn has_forwarded_header(headers: &HeaderMap) -> bool {
+    headers.contains_key("x-forwarded-for") || headers.contains_key("x-real-ip")
+}
+
+/// Warns at most once a minute per peer so spoofing attempts cannot flood logs.
+fn warn_untrusted_forwarded(peer: IpAddr) {
+    static LAST: std::sync::OnceLock<std::sync::Mutex<Option<(IpAddr, i64)>>> =
+        std::sync::OnceLock::new();
+    let slot = LAST.get_or_init(|| std::sync::Mutex::new(None));
+    let now = rt_core::auth::now_ms();
+    if let Ok(mut last) = slot.lock() {
+        let repeated = matches!(*last, Some((ip, at)) if ip == peer && now - at < 60_000);
+        if !repeated {
+            *last = Some((peer, now));
+            tracing::warn!(
+                target: "server",
+                peer = %peer,
+                "ignoring x-forwarded-for from an untrusted peer"
+            );
+        }
+    }
+}
+
+/// Stable, non-secret key for the per-session read budget.
+pub(crate) fn budget_key(req: &Request, ctx: &SessionContext) -> String {
+    match req.extensions().get::<PresentedToken>() {
+        Some(token) => format!("token:{}", rt_core::crypto::sha256_hex(token.0.as_bytes())),
+        None => format!("user:{}:{}", ctx.username, ctx.auth_kind),
+    }
 }
 
 fn forwarded_ip(headers: &HeaderMap) -> Option<IpAddr> {
@@ -516,4 +570,187 @@ pub(crate) async fn method_not_allowed_fallback() -> Response {
         .headers_mut()
         .insert(header::ALLOW, HeaderValue::from_static("GET, POST"));
     response
+}
+
+/// Rejects requests whose `Host` or `Origin` do not belong to this server.
+///
+/// The bearer token is the real authority, but a browser on a malicious page
+/// can still reach a loopback listener; checking the host defeats DNS
+/// rebinding and checking the origin defeats cross-site websocket hijacking
+/// (SECURITY.md S-10).
+pub(crate) async fn origin_layer(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let request_id = req_id(&req);
+    let path = req.uri().path().to_string();
+    let headers = req.headers().clone();
+
+    let Some(raw_host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return error_response(
+            ApiErrorBody::new(ErrorCode::BadRequest, "missing host header")
+                .with_request_id(request_id),
+        );
+    };
+    let Some(host) = normalise_host(raw_host) else {
+        return error_response(
+            ApiErrorBody::new(ErrorCode::BadRequest, "invalid host header")
+                .with_request_id(request_id),
+        );
+    };
+    if !host_allowed(&state, &host) {
+        tracing::warn!(
+            target: "server",
+            host = %host,
+            path = %path,
+            "rejected a request for a host this server does not answer to"
+        );
+        return error_response(
+            ApiErrorBody::new(ErrorCode::Forbidden, "request host is not allowed")
+                .with_request_id(request_id),
+        );
+    }
+
+    let expected_scheme = if state.cfg().server.tls {
+        "https"
+    } else {
+        "http"
+    };
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        let allowed = origin_scheme_and_host(origin)
+            .map(|(scheme, origin_host)| scheme == expected_scheme && origin_host == host)
+            .unwrap_or(false);
+        if !allowed {
+            tracing::warn!(
+                target: "server",
+                origin = %origin,
+                host = %host,
+                path = %path,
+                "rejected a cross-origin request"
+            );
+            return error_response(
+                ApiErrorBody::new(ErrorCode::Forbidden, "cross-origin request rejected")
+                    .with_request_id(request_id),
+            );
+        }
+    } else if headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|site| site.eq_ignore_ascii_case("cross-site"))
+    {
+        tracing::warn!(
+            target: "server",
+            host = %host,
+            path = %path,
+            "rejected a cross-site request without an origin header"
+        );
+        return error_response(
+            ApiErrorBody::new(ErrorCode::Forbidden, "cross-origin request rejected")
+                .with_request_id(request_id),
+        );
+    }
+
+    next.run(req).await
+}
+
+/// Lower-cases a `host[:port]` (or `[ipv6]` / `[ipv6]:port`) value to a bare host.
+fn normalise_host(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let host = if let Some(rest) = value.strip_prefix('[') {
+        // Bracketed IPv6 literal, optionally followed by a port.
+        let end = rest.find(']')?;
+        &rest[..end]
+    } else if value.matches(':').count() == 1 {
+        // Exactly one colon: a port separator. Bare IPv6 keeps every colon.
+        value.split(':').next().unwrap_or(value)
+    } else {
+        value
+    };
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+/// Splits an `Origin` header into its scheme and host.
+fn origin_scheme_and_host(origin: &str) -> Option<(String, String)> {
+    let (scheme, authority) = origin.trim().split_once("://")?;
+    let authority = authority.split('/').next()?;
+    Some((scheme.to_ascii_lowercase(), normalise_host(authority)?))
+}
+
+/// True when `host` is one of the names this server answers to.
+fn host_allowed(state: &AppState, host: &str) -> bool {
+    allowed_host_list(state).iter().any(|entry| entry == host)
+}
+
+/// Names and addresses this server answers to.
+fn allowed_host_list(state: &AppState) -> Vec<String> {
+    let mut hosts = vec![
+        "127.0.0.1".to_string(),
+        "localhost".to_string(),
+        "::1".to_string(),
+    ];
+
+    let machine = rt_core::util::hostname().to_ascii_lowercase();
+    if !machine.is_empty() {
+        if let Some((short, _)) = machine.split_once('.') {
+            hosts.push(short.to_string());
+        }
+        hosts.push(machine);
+    }
+
+    let cfg = state.cfg();
+    let display = cfg.server_display_name().trim().to_ascii_lowercase();
+    if !display.is_empty() {
+        hosts.push(display);
+    }
+
+    if let Some(host) = normalise_host(&cfg.server.bind) {
+        hosts.push(host);
+    }
+    if let Some(addr) = state.runtime_addr() {
+        let ip = addr.ip();
+        if !ip.is_unspecified() {
+            hosts.push(ip.to_string());
+        }
+    }
+    if let Some(ip) = primary_local_ip() {
+        hosts.push(ip.to_string());
+    }
+
+    // Host-shaped allow-list entries (`nas.local`, `mybox`) are extra names.
+    for entry in &cfg.server.ip_allowlist {
+        let entry = entry.trim();
+        if entry.is_empty() || entry.parse::<IpAddr>().is_ok() {
+            continue;
+        }
+        let Some(host) = normalise_host(entry) else {
+            continue;
+        };
+        let host_shaped = host
+            .chars()
+            .any(|c| !(c.is_ascii_digit() || c == '.' || c == ':'));
+        if host_shaped {
+            hosts.push(host);
+        }
+    }
+
+    hosts.retain(|host| !host.is_empty());
+    hosts.dedup();
+    hosts
+}
+
+/// Address of the interface that reaches the internet, used in the host allow-list.
+///
+/// Connecting a UDP socket sends no packets; it only asks the routing table.
+fn primary_local_ip() -> Option<IpAddr> {
+    static LOCAL_IP: std::sync::OnceLock<Option<IpAddr>> = std::sync::OnceLock::new();
+    *LOCAL_IP.get_or_init(|| {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        socket.connect("8.8.8.8:80").ok()?;
+        socket.local_addr().ok().map(|addr| addr.ip())
+    })
 }

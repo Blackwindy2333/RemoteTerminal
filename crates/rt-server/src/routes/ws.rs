@@ -26,7 +26,7 @@ use rt_protocol::ws::{WsClientMessage, WsInfo, WsServerMessage};
 use rt_protocol::{ExecRequest, ExecSummary, OutputStream};
 
 use crate::middleware::{api_detail, error_response};
-use crate::state::{AppState, WS_MAX_CONCURRENT_STREAMS, WS_MAX_MESSAGE_BYTES};
+use crate::state::{AppState, TicketError, WS_MAX_CONCURRENT_STREAMS, WS_MAX_MESSAGE_BYTES};
 
 /// How many bytes of each stream tail are echoed in `exec_finished`.
 const TAIL_BYTES: usize = 2000;
@@ -129,11 +129,23 @@ fn drop_notice(dropped: u64) -> WsServerMessage {
 /// `GET /api/v1/ws?ticket=` — validates the ticket, then upgrades.
 pub(crate) async fn upgrade(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let ticket = ticket_from_query(req.uri().query().unwrap_or_default());
-    let Some(ctx) = state.take_ticket(&ticket) else {
-        return error_response(ApiErrorBody::new(
-            ErrorCode::Unauthorized,
-            "invalid or expired websocket ticket",
-        ));
+    // The ticket is bound to the address that minted it, so a ticket can only
+    // be redeemed by the client it was issued to (SECURITY.md S-24).
+    let client_ip = crate::middleware::client_of(&req).ip;
+    let ctx = match state.take_ticket(&ticket, &client_ip) {
+        Ok(ctx) => ctx,
+        Err(TicketError::Unknown) => {
+            return error_response(ApiErrorBody::new(
+                ErrorCode::Unauthorized,
+                "invalid or expired websocket ticket",
+            ))
+        }
+        Err(TicketError::AddressMismatch) => {
+            return error_response(ApiErrorBody::new(
+                ErrorCode::Forbidden,
+                "this websocket ticket was issued to another address",
+            ))
+        }
     };
 
     let (mut parts, _body) = req.into_parts();

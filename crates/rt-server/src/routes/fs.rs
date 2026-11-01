@@ -180,20 +180,68 @@ pub(crate) async fn copy(
 }
 
 /// `GET /api/v1/fs/read?path=&offset=&length=` — inline text/base64 preview.
+///
+/// Reads are audited and metered per session: inline previews are otherwise a
+/// quiet way to pull a whole disk out of a workspace jail (SECURITY.md S-09).
 pub(crate) async fn read(
     State(state): State<Arc<AppState>>,
     ApiQuery(query): ApiQuery<ReadQuery>,
     req: Request,
 ) -> ApiResult<Json<ReadFileResult>> {
-    let _ctx = session_of(&req)?;
-    let guard = state.guard(_ctx.scope)?;
+    let ctx = session_of(&req)?;
+    let request_id = req_id(&req);
+    let budget = crate::middleware::budget_key(&req, &ctx);
+    let guard = state.guard(ctx.scope)?;
     let limits = state.fs_limits();
     let path = query.path;
     let offset = query.offset.unwrap_or(0);
     let length = query.length;
-    Ok(Json(
-        blocking(move || fsops::read(&guard, &path, offset, length, &limits)).await?,
-    ))
+    let display_path = path.clone();
+
+    let result = match blocking(move || fsops::read(&guard, &path, offset, length, &limits)).await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            audit_fs(
+                &state,
+                &ctx,
+                "fs.read",
+                &display_path,
+                Some(&err),
+                None,
+                &request_id,
+            );
+            return Err(err);
+        }
+    };
+
+    if let Err(err) = state.read_budget().charge(&budget, result.returned.max(1)) {
+        let failure = ApiErr::from(err);
+        audit_fs(
+            &state,
+            &ctx,
+            "fs.read",
+            &display_path,
+            Some(&failure),
+            Some(format!("offset={} returned={}", result.offset, result.returned)),
+            &request_id,
+        );
+        return Err(failure);
+    }
+
+    audit_fs(
+        &state,
+        &ctx,
+        "fs.read",
+        &display_path,
+        None,
+        Some(format!(
+            "offset={} returned={} size={}",
+            result.offset, result.returned, result.size
+        )),
+        &request_id,
+    );
+    Ok(Json(result))
 }
 
 /// `GET /api/v1/fs/download?path=` — streams a file, honouring `Range`.
@@ -204,6 +252,7 @@ pub(crate) async fn download(
 ) -> ApiResult<Response> {
     let ctx = session_of(&req)?;
     let request_id = req_id(&req);
+    let budget = crate::middleware::budget_key(&req, &ctx);
     let range_header = req
         .headers()
         .get(header::RANGE)
@@ -253,6 +302,22 @@ pub(crate) async fn download(
     };
 
     let (start, length) = byte_range.bounds(size);
+
+    // Downloads share the per-session read budget with inline previews.
+    if let Err(err) = state.read_budget().charge(&budget, length.max(1)) {
+        let failure = ApiErr::from(err);
+        audit_fs(
+            &state,
+            &ctx,
+            "fs.download",
+            &display_path,
+            Some(&failure),
+            Some(format!("{length} bytes")),
+            &request_id,
+        );
+        return Err(failure);
+    }
+
     let mut handle = tokio::fs::File::from_std(file);
     if start > 0 {
         if let Err(err) = handle.seek(std::io::SeekFrom::Start(start)).await {

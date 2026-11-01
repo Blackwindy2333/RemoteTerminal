@@ -10,12 +10,12 @@ use std::sync::Arc;
 
 use axum::body::{to_bytes, Body};
 use axum::extract::connect_info::MockConnectInfo;
-use axum::http::{header, HeaderMap, Method, Request, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode};
 use axum::response::Response;
 use axum::Router;
 use rt_core::config::{ApiKeyConfig, Config, ResolvedPaths, UserConfig};
 use rt_core::crypto;
-use rt_core::logging::LogEventSink;
+use rt_core::logging::{AuditLog, LogEventSink};
 use rt_server::{router, AppState, ServerOptions};
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -23,6 +23,9 @@ use tower::ServiceExt;
 
 /// Password shared by the fixture users.
 const PASSWORD: &str = "password123";
+
+/// `Host` the mocked client speaks to (matches [`peer`]).
+const HOST: &str = "127.0.0.1:51234";
 
 /// Upper bound for one response body read in the tests.
 const BODY_LIMIT: usize = 16 * 1024 * 1024;
@@ -35,6 +38,8 @@ struct Fixture {
     app: Router,
     /// Raw value of `server.api_keys[0]`; only its digest is configured.
     api_key: String,
+    /// Audit trail location, when the fixture records one.
+    audit_file: Option<std::path::PathBuf>,
 }
 
 impl Fixture {
@@ -43,6 +48,15 @@ impl Fixture {
     }
 
     fn with(tweak: impl FnOnce(&mut Config)) -> Self {
+        Self::build(tweak, false)
+    }
+
+    /// Fixture with a real JSONL audit trail next to the temporary workspace.
+    fn with_audit() -> Self {
+        Self::build(|_| {}, true)
+    }
+
+    fn build(tweak: impl FnOnce(&mut Config), with_audit: bool) -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
         let workspace = dir.path().join("workspace");
         std::fs::create_dir_all(&workspace).expect("create workspace");
@@ -79,11 +93,16 @@ impl Fixture {
         tweak(&mut config);
 
         let paths = ResolvedPaths::resolve(&config, dir.path());
+        let audit_file = with_audit.then(|| dir.path().join("logs").join("audit.jsonl"));
+        let audit = audit_file.as_ref().map(|path| {
+            std::fs::create_dir_all(path.parent().expect("audit parent")).expect("log dir");
+            Arc::new(AuditLog::open(path).expect("audit log"))
+        });
         let state = AppState::new(ServerOptions {
             config,
             paths,
             sink: LogEventSink::new(256),
-            audit: None,
+            audit,
         })
         .expect("app state");
         let app = router(Arc::clone(&state)).layer(MockConnectInfo(peer()));
@@ -93,15 +112,12 @@ impl Fixture {
             state,
             app,
             api_key,
+            audit_file,
         }
     }
 
     async fn call(&self, req: Request<Body>) -> Response {
-        self.app
-            .clone()
-            .oneshot(req)
-            .await
-            .expect("router is infallible")
+        send(&self.app, req).await
     }
 
     async fn login(&self, user: &str, password: &str) -> Response {
@@ -123,6 +139,24 @@ impl Fixture {
             .expect("access_token in login response")
             .to_string()
     }
+}
+
+/// Runs one request through a router, defaulting `Host` to the mocked listener.
+async fn send(app: &Router, mut req: Request<Body>) -> Response {
+    // Every request has to name a host this server answers to; unless a test is
+    // deliberately probing the host guard, that is loopback.
+    if !req.headers().contains_key(header::HOST) {
+        req.headers_mut().insert(header::HOST, HeaderValue::from_static(HOST));
+    }
+    app.clone()
+        .oneshot(req)
+        .await
+        .expect("router is infallible")
+}
+
+/// Second router over the same state, used to simulate another client address.
+fn app_for(state: &Arc<AppState>, peer: SocketAddr) -> Router {
+    router(Arc::clone(state)).layer(MockConnectInfo(peer))
 }
 
 /// The peer address every mocked request pretends to come from.
@@ -283,18 +317,35 @@ async fn login_issues_a_full_scope_token() {
 }
 
 #[tokio::test]
-async fn login_failure_reports_remaining_attempts() {
+async fn login_failure_gives_one_uniform_answer() {
     let fx = Fixture::new();
-    let (status, _, body) = split(fx.login("admin", "definitely-wrong").await).await;
+    let mut bodies = Vec::new();
+    for _ in 0..3 {
+        let (status, _, body) = split(fx.login("admin", "definitely-wrong").await).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "unauthorized");
+        // SECURITY.md S-32: no attempt counter, no hint about which half of the
+        // credential pair was wrong.
+        assert!(
+            body["error"]["detail"].is_null(),
+            "failure body must not carry detail: {body}"
+        );
+        assert!(
+            !body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("attempt"),
+            "failure message leaks the attempt counter: {body}"
+        );
+        bodies.push(body["error"]["message"].clone());
+    }
+    assert_eq!(bodies[0], bodies[1], "answers must not change per attempt");
+    assert_eq!(bodies[1], bodies[2], "answers must not change per attempt");
+
+    // An unknown user and a wrong password are indistinguishable.
+    let (status, _, unknown) = split(fx.login("nobody", "definitely-wrong").await).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(body["error"]["code"], "unauthorized");
-    let remaining = body["error"]["detail"]["remaining_attempts"]
-        .as_u64()
-        .expect("remaining_attempts detail");
-    assert!(
-        remaining > 0 && remaining < 5,
-        "expected a decreasing counter, got {remaining}"
-    );
+    assert_eq!(unknown["error"]["message"], bodies[0]);
 }
 
 #[tokio::test]
@@ -624,7 +675,7 @@ async fn ws_ticket_is_issued_and_bogus_tickets_are_rejected() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body["ticket"].as_str().map(|t| !t.is_empty()).unwrap_or(false));
-    assert_eq!(body["expires_in_secs"], 60);
+    assert_eq!(body["expires_in_secs"], 15);
     assert_eq!(body["ws_path"], rt_protocol::ws::WS_PATH);
 
     let (status, _, body) = split(fx.call(get("/api/v1/ws?ticket=not-a-ticket")).await).await;
@@ -1103,6 +1154,22 @@ async fn process_listing_requires_full_scope() {
         let (status, _, body) = split(fx.call(authed_get(uri, &worker)).await).await;
         assert_eq!(status, StatusCode::OK, "{uri}: {body}");
     }
+
+    // SECURITY.md S-27: the overview must not hand a jailed session the host
+    // layout, and a full-scope session still sees the real paths.
+    let (status, _, body) = split(fx.call(authed_get("/api/v1/sysinfo", &worker)).await).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["app"]["workspace_root"], "\\", "{body}");
+    assert_eq!(body["app"]["config_path"], "", "{body}");
+    assert_eq!(body["app"]["data_dir"], "", "{body}");
+    assert!(
+        body.get("processes").is_none(),
+        "the snapshot must not embed a process table: {body}"
+    );
+
+    let (status, _, body) = split(fx.call(authed_get("/api/v1/sysinfo", &admin)).await).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(body["app"]["config_path"], "", "{body}");
 }
 
 #[tokio::test]
@@ -1159,4 +1226,238 @@ async fn serve_refuses_a_configuration_the_validator_rejects() {
         .expect_err("plaintext HTTP on a LAN bind must be refused");
     let text = error.to_string().to_lowercase();
     assert!(text.contains("tls"), "unexpected error: {text}");
+}
+#[tokio::test]
+async fn request_host_and_origin_are_validated() {
+    let fx = Fixture::new();
+
+    // A page served from an attacker-controlled name must not reach us (DNS
+    // rebinding).
+    let rebound = Request::builder()
+        .method(Method::GET)
+        .uri("/healthz")
+        .header(header::HOST, "evil.example")
+        .body(Body::empty())
+        .expect("request");
+    let (status, _, body) = split(send(&fx.app, rebound).await).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "forbidden");
+    assert!(body["error"]["request_id"].as_str().is_some(), "{body}");
+
+    // A request without any Host header is malformed. `send` would fill one in,
+    // so this one goes straight to the router.
+    let anonymous = Request::builder()
+        .method(Method::GET)
+        .uri("/healthz")
+        .body(Body::empty())
+        .expect("request");
+    let raw = fx
+        .app
+        .clone()
+        .oneshot(anonymous)
+        .await
+        .expect("router is infallible");
+    let (status, _, body) = split(raw).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "bad_request", "{body}");
+
+    // Cross-site origin, and its header-less variant.
+    let cross_site = Request::builder()
+        .method(Method::GET)
+        .uri("/healthz")
+        .header(header::HOST, HOST)
+        .header(header::ORIGIN, "https://evil.example")
+        .body(Body::empty())
+        .expect("request");
+    let (status, _, body) = split(send(&fx.app, cross_site).await).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let fetch_metadata = Request::builder()
+        .method(Method::GET)
+        .uri("/api/v1/info")
+        .header(header::HOST, HOST)
+        .header("sec-fetch-site", "cross-site")
+        .body(Body::empty())
+        .expect("request");
+    let (status, _, body) = split(send(&fx.app, fetch_metadata).await).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // Same-origin callers are unaffected; the scheme has to match the listener.
+    let same_origin = Request::builder()
+        .method(Method::GET)
+        .uri("/api/v1/info")
+        .header(header::HOST, HOST)
+        .header(header::ORIGIN, format!("http://{HOST}"))
+        .header("sec-fetch-site", "same-origin")
+        .body(Body::empty())
+        .expect("request");
+    let (status, _, body) = split(send(&fx.app, same_origin).await).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let wrong_scheme = Request::builder()
+        .method(Method::GET)
+        .uri("/api/v1/info")
+        .header(header::HOST, HOST)
+        .header(header::ORIGIN, format!("https://{HOST}"))
+        .body(Body::empty())
+        .expect("request");
+    let (status, _, _) = split(send(&fx.app, wrong_scheme).await).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn forwarded_headers_are_only_trusted_from_a_local_peer() {
+    // An allow-list that only matches the forwarded address: the request is
+    // accepted exactly when the proxy hop is trusted (SECURITY.md S-11).
+    let fixture = || {
+        Fixture::with(|cfg| {
+            cfg.server.trust_forwarded_for = true;
+            cfg.server.ip_allowlist = vec!["10.9.9.".to_string()];
+        })
+    };
+
+    let forwarded = || {
+        Request::builder()
+            .method(Method::GET)
+            .uri("/healthz")
+            .header(header::HOST, HOST)
+            .header("x-forwarded-for", "10.9.9.9")
+            .body(Body::empty())
+            .expect("request")
+    };
+
+    // Loopback peer: a reverse proxy on the same machine is believed.
+    let local = fixture();
+    let (status, _, _) = split(local.call(forwarded()).await).await;
+    assert_eq!(status, StatusCode::OK, "local proxy must be trusted");
+
+    // Remote peer: the header is attacker-controlled and must be ignored.
+    let remote = fixture();
+    let far_away = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)), 41000);
+    let (status, _, body) = split(send(&app_for(&remote.state, far_away), forwarded()).await).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "forbidden");
+}
+
+#[tokio::test]
+async fn websocket_tickets_are_bound_to_the_issuing_address() {
+    let fx = Fixture::new();
+    let token = fx.token("admin").await;
+    let (status, _, body) = split(fx.call(authed_post("/api/v1/auth/ws-ticket", &token)).await).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ticket = body["ticket"].as_str().expect("ticket").to_string();
+
+    let ticket_request = || {
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!("/api/v1/ws?ticket={ticket}"))
+            .body(Body::empty())
+            .expect("request")
+    };
+
+    // Another address (a leaked ticket) cannot redeem it.
+    let stranger = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 4444);
+    let (status, _, body) =
+        split(send(&app_for(&fx.state, stranger), ticket_request()).await).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "forbidden");
+
+    // Even the rightful client finds the ticket consumed after a misuse.
+    let (status, _, body) = split(fx.call(ticket_request()).await).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"]["code"], "unauthorized");
+}
+
+#[tokio::test]
+async fn repeated_failures_back_off_per_account() {
+    // Keep the per-address lockout out of the way so the account throttle is
+    // what answers (SECURITY.md S-22).
+    let fx = Fixture::with(|cfg| cfg.server.login_max_attempts = 100_000);
+    for attempt in 1..=4 {
+        let (status, _, _) = split(fx.login("admin", "definitely-wrong").await).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "attempt {attempt} must reach the password check");
+    }
+
+    let (status, headers, body) = split(fx.login("admin", PASSWORD).await).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(body["error"]["code"], "rate_limited");
+    assert!(body["error"]["retry_after_secs"].as_u64().unwrap_or(0) >= 1, "{body}");
+    assert!(headers.contains_key(header::RETRY_AFTER), "{body}");
+
+    // Other accounts are unaffected.
+    let (status, _, body) = split(fx.login("worker", PASSWORD).await).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn credential_changes_apply_without_a_restart() {
+    let fx = Fixture::new();
+    let existing = fx.token("worker").await;
+    let current = split(fx.call(authed_get("/api/v1/auth/me", &fx.api_key)).await).await;
+    assert_eq!(current.0, StatusCode::OK, "the configured key starts out valid");
+
+    // Rewrite the configuration file: drop the API key, add a user.
+    let mut config = fx.state.config();
+    config.server.api_keys.clear();
+    config.server.users.push(UserConfig {
+        name: "fresh".to_string(),
+        password_hash: crypto::hash_password("password456").expect("hash fresh"),
+        scope: "workspace".to_string(),
+        enabled: true,
+    });
+    config
+        .save_atomic(&fx.state.paths().config_file)
+        .expect("save config");
+    // Reloading is throttled to once a second.
+    tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+
+    let revoked = split(fx.call(authed_get("/api/v1/auth/me", &fx.api_key)).await).await;
+    assert_eq!(revoked.0, StatusCode::UNAUTHORIZED, "revoked key: {}", revoked.2);
+    assert_eq!(revoked.2["error"]["code"], "unauthorized");
+
+    let (status, _, body) = split(fx.login("fresh", "password456").await).await;
+    assert_eq!(status, StatusCode::OK, "new user must be able to sign in: {body}");
+    assert_eq!(body["scope"], "workspace");
+
+    // Sessions issued before the change keep working.
+    let (status, _, _) = split(fx.call(authed_get("/api/v1/auth/me", &existing)).await).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn file_reads_are_recorded_in_the_audit_trail() {
+    let fx = Fixture::with_audit();
+    let token = fx.token("worker").await;
+
+    let upload = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/fs/write?path=note.txt")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from("hello audit"))
+        .expect("request");
+    let (status, _, body) = split(fx.call(upload).await).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, _, body) = split(
+        fx.call(authed_get("/api/v1/fs/read?path=note.txt", &token))
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["text"], "hello audit");
+
+    let path = fx.audit_file.clone().expect("audit trail");
+    let trail = std::fs::read_to_string(path).expect("read audit trail");
+    let record: Value = trail
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|value| value["action"] == "fs.read")
+        .expect("fs.read must be audited");
+    assert_eq!(record["result"], "success");
+    assert_eq!(record["username"], "worker");
+    let detail = record["detail"].as_str().unwrap_or_default();
+    assert!(detail.contains("returned=11"), "unexpected detail: {detail}");
+    assert!(record["request_id"].as_str().is_some(), "{record}");
 }

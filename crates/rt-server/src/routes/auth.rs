@@ -55,7 +55,30 @@ pub(crate) async fn login(
             .with_request_id(request_id));
     }
 
-    let users = cfg.server.users.clone();
+    // A per-account counter stops one client from burning through a whole
+    // user name while rotating source addresses (SECURITY.md S-22).
+    if let Err(err) = state.user_throttle().check(&crate::state::username_key(&body.username)) {
+        let (message, retry_after) = match err {
+            RtError::RateLimited {
+                message,
+                retry_after_secs,
+            } => (message, retry_after_secs),
+            other => (other.public_message(), 60),
+        };
+        state.record_audit(
+            AuditEvent::new("auth.login", "throttled")
+                .user(body.username.clone())
+                .remote(client.remote())
+                .detail(message.clone())
+                .request_id(request_id.clone()),
+        );
+        return Err(ApiErr::new(ErrorCode::RateLimited, message)
+            .with_retry_after(retry_after)
+            .with_request_id(request_id));
+    }
+
+    // Credentials come from the live snapshot so edited users apply at once.
+    let users = state.credentials().users.clone();
     let username = body.username.clone();
     let password = body.password.clone();
     let verified = tokio::task::spawn_blocking(move || {
@@ -69,32 +92,40 @@ pub(crate) async fn login(
         Ok(found) => found,
         Err(err) => {
             let remaining = state.login_limiter().record_failure(&client.ip);
+            let account = state.user_throttle().record_failure(&crate::state::username_key(&body.username));
             state.record_audit(
                 AuditEvent::new("auth.login", "failure")
                     .user(body.username.clone())
                     .remote(client.remote())
                     .target(body.username.clone())
-                    .detail(err.public_message())
+                    .detail(format!(
+                        "{} (ip attempts left={remaining}, account failures={}, account backoff={}s)",
+                        err.public_message(),
+                        account.failures,
+                        account.retry_after_secs
+                    ))
                     .request_id(request_id.clone()),
             );
-            let message = if remaining == 0 {
-                "invalid username or password; too many failed attempts, try again later".to_string()
-            } else {
-                format!(
-                    "invalid username or password ({remaining} attempt{} left)",
-                    if remaining == 1 { "" } else { "s" }
-                )
-            };
-            let mut api_err = ApiErr::new(ErrorCode::Unauthorized, message.clone())
-                .with_detail(serde_json::json!({ "remaining_attempts": remaining }));
-            if remaining == 0 {
-                api_err = api_err.with_retry_after(cfg.server.login_lockout_secs.max(1));
-            }
-            return Err(api_err.with_request_id(request_id));
+            tracing::info!(
+                target: "auth",
+                user = %body.username,
+                remote = %client.ip,
+                remaining_ip_attempts = remaining,
+                account_failures = account.failures,
+                "login failed"
+            );
+            // One uniform answer: no attempt counters, no hints about which
+            // half of the credential pair was wrong (SECURITY.md S-32).
+            return Err(ApiErr::new(
+                ErrorCode::Unauthorized,
+                "invalid username or password",
+            )
+            .with_request_id(request_id));
         }
     };
 
     state.login_limiter().record_success(&client.ip);
+    state.user_throttle().record_success(&crate::state::username_key(&body.username));
     let (token, session) = state.session_store().issue(
         &username,
         scope,
@@ -182,7 +213,9 @@ pub(crate) async fn ws_ticket(
     req: Request,
 ) -> ApiResult<Json<WsTicketResponse>> {
     let ctx = session_of(&req)?;
-    let ticket = state.issue_ticket(&ctx);
+    // The ticket is bound to the address that minted it (SECURITY.md S-24).
+    let client = client_of(&req);
+    let ticket = state.issue_ticket(&ctx, &client.ip);
     Ok(Json(WsTicketResponse {
         ticket,
         expires_in_secs: (WS_TICKET_TTL_MS / 1000) as u64,

@@ -85,6 +85,12 @@ pub(crate) fn build(state: Arc<AppState>) -> Router {
             state.clone(),
             crate::middleware::timeout_layer,
         ))
+        // Host / Origin validation runs before authentication so DNS rebinding
+        // and cross-site requests never reach the credential path.
+        .layer(layer::from_fn_with_state(
+            state.clone(),
+            crate::middleware::origin_layer,
+        ))
         .layer(layer::from_fn_with_state(
             state,
             crate::middleware::request_id_layer,
