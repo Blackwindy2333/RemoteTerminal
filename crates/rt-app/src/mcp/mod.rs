@@ -178,8 +178,28 @@ pub fn config_snippet(
     let (label, argument) = match (raw, profile) {
         (Some(raw), Some(saved)) => (saved.name.clone(), raw.to_string()),
         (None, Some(saved)) => (saved.name.clone(), saved.name.clone()),
-        // An inline target already carries everything the profile would.
-        (Some(raw), None) => (raw.to_string(), raw.to_string()),
+        // A bare word is meant as a profile name, so a typo must not silently
+        // become an inline host: the pasted snippet would connect nowhere.
+        (Some(raw), None) if !raw.contains('@') && !raw.contains(':') && !raw.contains('#') => {
+            let known: Vec<&str> = config
+                .client
+                .hosts
+                .iter()
+                .map(|h| h.name.as_str())
+                .collect();
+            let known = if known.is_empty() {
+                "none".to_string()
+            } else {
+                known.join(", ")
+            };
+            return Err(format!(
+                "`{raw}` is not a saved host; known profiles: {known} \
+                 (save a new one with `remote-terminal fingerprint <host:port> --save {raw}`)"
+            ));
+        }
+        // An inline target already carries everything the profile would, but
+        // the server key must not embed the password it contains.
+        (Some(raw), None) => (inline_label(raw), raw.to_string()),
         (None, None) => {
             return Err(
                 "no saved host yet: run `remote-terminal fingerprint <host>:port --save <name>` \
@@ -206,11 +226,23 @@ pub fn config_snippet(
                 .to_string(),
         );
     }
-    notes.push(
-        "replace REPLACE_WITH_THE_PASSWORD with the account password, or use \
-         \"RT_TOKEN\": \"rt_…\" instead of RT_PASSWORD"
-            .to_string(),
-    );
+    // An inline target may already carry its own credentials, in which case the
+    // placeholder would just be one more thing to delete.
+    let target_has_secret = profile.is_none()
+        && (argument.contains('@') || argument.contains("token=") || argument.contains("api_key="));
+    if target_has_secret {
+        notes.push(
+            "the credentials are inside the target argument; keep that file private, or move \
+             them to RT_PASSWORD / RT_TOKEN in the environment"
+                .to_string(),
+        );
+    } else {
+        notes.push(
+            "replace REPLACE_WITH_THE_PASSWORD with the account password, or use \
+             \"RT_TOKEN\": \"rt_…\" instead of RT_PASSWORD"
+                .to_string(),
+        );
+    }
 
     let name: String = label
         .chars()
@@ -257,10 +289,12 @@ pub fn config_snippet(
     entry.insert("enabled".into(), json!(true));
     entry.insert("command".into(), json!(exe.display().to_string()));
     entry.insert("args".into(), json!(args));
-    entry.insert(
-        "env".into(),
-        json!({ "RT_PASSWORD": "REPLACE_WITH_THE_PASSWORD" }),
-    );
+    if !target_has_secret {
+        entry.insert(
+            "env".into(),
+            json!({ "RT_PASSWORD": "REPLACE_WITH_THE_PASSWORD" }),
+        );
+    }
     entry.insert("cwd".into(), json!(cwd));
     let mut servers = serde_json::Map::new();
     servers.insert(name.to_string(), serde_json::Value::Object(entry));
@@ -410,6 +444,23 @@ impl McpState {
                 &format!("method not found: {other}"),
             )),
         }
+    }
+}
+
+/// A registration key for an inline target: the host part only, so credentials
+/// typed into the target never end up in the JSON key.
+fn inline_label(raw: &str) -> String {
+    let without_scheme = raw.split_once("://").map(|(_, rest)| rest).unwrap_or(raw);
+    let authority = without_scheme
+        .rsplit_once('@')
+        .map(|(_, rest)| rest)
+        .unwrap_or(without_scheme);
+    let authority = authority.split_once('?').map(|(head, _)| head).unwrap_or(authority);
+    let label = authority.trim();
+    if label.is_empty() {
+        "remote-terminal".to_string()
+    } else {
+        label.to_string()
     }
 }
 
@@ -623,7 +674,40 @@ mod tests {
     #[test]
     fn snippet_explains_what_to_do_without_any_host() {
         let cfg = rt_core::config::Config::default();
-        let err = config_snippet(&cfg, None, std::path::Path::new("rt.exe"), None).expect_err("no host");
+        let err = config_snippet(&cfg, None, std::path::Path::new("rt.exe"), None)
+            .expect_err("no host");
         assert!(err.contains("--save"), "{err}");
+    }
+
+    #[test]
+    fn snippet_refuses_an_unknown_profile_name() {
+        let mut cfg = rt_core::config::Config::default();
+        cfg.client.hosts.push(rt_core::config::HostConfig {
+            name: "office".into(),
+            host: "10.0.0.5".into(),
+            port: 6000,
+            fingerprint: None,
+            username: "alice".into(),
+            last_scope: None,
+            last_connected: None,
+            auto_connect: true,
+        });
+        let err = config_snippet(&cfg, Some("ofice"), std::path::Path::new("rt.exe"), None)
+            .expect_err("typo");
+        assert!(err.contains("office"), "{err}");
+        assert!(err.contains("--save"), "{err}");
+        // An inline target still passes through untouched.
+        let inline = config_snippet(
+            &cfg,
+            Some("alice@10.0.0.5:6000#AB"),
+            std::path::Path::new("rt.exe"),
+            None,
+        )
+        .expect("inline target");
+        let value: Value = serde_json::from_str(&inline.json).expect("valid json");
+        let servers = value["servers"].as_object().expect("servers");
+        let key = servers.keys().next().expect("one server");
+        assert!(!key.contains("alice"), "the key leaks the user name: {key}");
+        assert_eq!(servers[key]["args"], json!(["mcp", "alice@10.0.0.5:6000#AB"]));
     }
 }
