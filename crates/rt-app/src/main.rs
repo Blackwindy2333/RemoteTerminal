@@ -126,6 +126,74 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::Approve {
+            tool,
+            minutes,
+            list,
+            revoke,
+        } => {
+            let boot =
+                rt_app::bootstrap::bootstrap(config_path.as_deref(), cli.verbose, true)?;
+            let approvals = rt_app::mcp::approval::Approvals::resolve(&boot.paths.data_dir);
+
+            if list || tool.is_none() {
+                approvals.prune();
+                let leases = approvals.listing();
+                println!("Approval file: {}", approvals.path().display());
+                println!(
+                    "Gate: {}",
+                    if approvals.enabled() {
+                        "on (destructive MCP tools need a lease)"
+                    } else {
+                        "off (RT_REQUIRE_APPROVAL is disabled)"
+                    }
+                );
+                if leases.is_empty() {
+                    println!("No active leases.");
+                } else {
+                    for (name, expires_ms, remaining) in leases {
+                        let when = chrono::DateTime::from_timestamp_millis(expires_ms)
+                            .map(|d| d.with_timezone(&chrono::Local).to_rfc3339())
+                            .unwrap_or_else(|| expires_ms.to_string());
+                        println!(
+                            "  {name:<14} expires {when} (in {} min)",
+                            remaining.as_secs() / 60
+                        );
+                    }
+                }
+                println!();
+                println!(
+                    "Gated tools: {}",
+                    rt_app::mcp::approval::DANGEROUS.join(", ")
+                );
+                return Ok(ExitCode::SUCCESS);
+            }
+
+            let tool = tool.expect("checked above");
+            if revoke {
+                let removed = approvals
+                    .revoke(&tool)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                println!(
+                    "{}",
+                    if removed {
+                        format!("Revoked the lease for {tool}.")
+                    } else {
+                        format!("No lease for {tool}.")
+                    }
+                );
+            } else {
+                let expires = approvals
+                    .grant(&tool, minutes)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                let when = chrono::DateTime::from_timestamp_millis(expires)
+                    .map(|d| d.with_timezone(&chrono::Local).to_rfc3339())
+                    .unwrap_or_else(|| expires.to_string());
+                println!("Approved {tool} for {minutes} minute(s), until {when}.");
+                println!("Written to {}", approvals.path().display());
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Info { target } => {
             let runtime = rt_app::bootstrap::runtime()?;
             let code = runtime.block_on(client_info(config_path, target))?;

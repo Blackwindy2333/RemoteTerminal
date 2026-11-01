@@ -14,6 +14,7 @@
 //! API key instead of a password, and `RT_FINGERPRINT` pins the TLS certificate
 //! (recommended: run `remote-terminal.exe fingerprint <host>:<port>` once).
 
+pub mod approval;
 pub mod tools;
 
 use std::path::PathBuf;
@@ -21,6 +22,7 @@ use std::path::PathBuf;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 
+use approval::Approvals;
 use tools::{Bridge, Endpoint};
 
 const SERVER_NAME: &str = "remote-terminal";
@@ -50,8 +52,29 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<i32> {
         "MCP bridge endpoint resolved"
     );
 
+    // S-17: destructive tools stay locked until the operator grants a lease.
+    let approvals = Approvals::resolve(&paths.data_dir);
+    if approvals.enabled() {
+        let pruned = approvals.prune();
+        let live = approvals.grants();
+        tracing::info!(
+            file = %approvals.path().display(),
+            pruned,
+            leases = live.len(),
+            "destructive MCP tools require an operator lease"
+        );
+        if live.is_empty() {
+            tracing::warn!(
+                "no destructive tool is currently approved; `rt_exec`, `rt_fs_write`, \
+                 `rt_fs_delete`, `rt_fs_rename`, `rt_fs_copy` and `rt_fs_upload` will be \
+                 refused until `remote-terminal approve <tool> --minutes N` runs"
+            );
+        }
+    }
+
     let mut state = McpState {
         endpoint,
+        approvals,
         bridge: None,
         connect_error: None,
     };
@@ -87,6 +110,7 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<i32> {
 
 struct McpState {
     endpoint: Endpoint,
+    approvals: Approvals,
     bridge: Option<Bridge>,
     connect_error: Option<String>,
 }
@@ -97,7 +121,7 @@ impl McpState {
     /// later call retries.
     async fn ensure_bridge(&mut self) -> Result<&Bridge, String> {
         if self.bridge.is_none() {
-            match Bridge::connect(self.endpoint.clone()).await {
+            match Bridge::connect(self.endpoint.clone(), self.approvals.clone()).await {
                 Ok(bridge) => {
                     tracing::info!(
                         host = %self.endpoint.host,
@@ -243,6 +267,7 @@ mod tests {
     use super::*;
 
     fn state() -> McpState {
+        let dir = std::env::temp_dir().join(format!("rt-mcp-test-{}", std::process::id()));
         McpState {
             endpoint: Endpoint {
                 host: "127.0.0.1".into(),
@@ -253,6 +278,7 @@ mod tests {
                 password: Some("x".into()),
                 api_key: None,
             },
+            approvals: Approvals::resolve(&dir),
             bridge: None,
             connect_error: None,
         }

@@ -12,10 +12,13 @@
 //! * `RT_USER` / `RT_PASSWORD` — password login
 //! * `RT_TOKEN` — API key (`rt_...`) instead of a password
 //! * `RT_FINGERPRINT` — pinned certificate fingerprint
-//! * `RT_INSECURE=1` — allow a plaintext HTTP connection
+//! * `RT_INSECURE=1` — allow a plaintext HTTP connection (also needs
+//!   `RT_ALLOW_PLAINTEXT=1`, see [`Endpoint::resolve`])
+//! * `RT_REQUIRE_APPROVAL=0` — disable the destructive-tool approval gate
+//! * `RT_DOWNLOAD_DIR` / `RT_CAPTURE_DIR` — sandbox for files written locally
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use rt_client::{RemoteClient, Target};
 use rt_core::config::{ClientConfig, Config};
@@ -24,6 +27,8 @@ use rt_protocol::{
     MkdirRequest, OutputEncoding, RenameRequest, ShellKind,
 };
 use serde_json::{json, Value};
+
+use super::approval::Approvals;
 
 // ---------------------------------------------------------------------------
 // Endpoint resolution
@@ -78,9 +83,29 @@ impl Endpoint {
             }
         }
 
+        // S-20: a plaintext connection sends the password in the clear, so it
+        // takes two deliberate opt-ins. `RT_INSECURE=1` alone is ignored (and
+        // complained about) rather than silently downgrading the transport.
         let insecure = env_first(&["RT_INSECURE", "REMOTE_TERMINAL_INSECURE"])
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        let allow_plaintext = env_first(&["RT_ALLOW_PLAINTEXT", "REMOTE_TERMINAL_ALLOW_PLAINTEXT"])
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let tls = if insecure && allow_plaintext {
+            tracing::warn!(
+                "RT_INSECURE=1: credentials will travel in plaintext; \
+                 only do this on a trusted point-to-point link"
+            );
+            false
+        } else {
+            if insecure {
+                tracing::warn!(
+                    "RT_INSECURE=1 ignored: plaintext also requires RT_ALLOW_PLAINTEXT=1"
+                );
+            }
+            true
+        };
 
         let fingerprint = env_first(&["RT_FINGERPRINT", "REMOTE_TERMINAL_FINGERPRINT"])
             .or_else(|| saved.and_then(|s| s.fingerprint.clone()));
@@ -88,7 +113,7 @@ impl Endpoint {
         Endpoint {
             host,
             port: port.unwrap_or(cfg.server.port),
-            tls: !insecure,
+            tls,
             fingerprint,
             username: env_first(&["RT_USER", "REMOTE_TERMINAL_USER"])
                 .or_else(|| saved.map(|s| s.username.clone()))
@@ -119,10 +144,12 @@ impl Endpoint {
 pub struct Bridge {
     pub client: RemoteClient,
     pub endpoint: Endpoint,
+    /// Operator leases for destructive tools (S-17).
+    pub approvals: Approvals,
 }
 
 impl Bridge {
-    pub async fn connect(endpoint: Endpoint) -> Result<Self, String> {
+    pub async fn connect(endpoint: Endpoint, approvals: Approvals) -> Result<Self, String> {
         let client = RemoteClient::new(endpoint.target())
             .map_err(|e| format!("cannot create client: {}", e.message()))?;
 
@@ -165,7 +192,11 @@ impl Bridge {
             }
         }
 
-        Ok(Self { client, endpoint })
+        Ok(Self {
+            client,
+            endpoint,
+            approvals,
+        })
     }
 
     pub fn tool_definitions() -> Vec<Value> {
@@ -315,6 +346,9 @@ impl Bridge {
     }
 
     pub async fn call(&self, name: &str, args: &Value) -> Result<Value, String> {
+        // S-17: destructive tools need an operator lease before anything is
+        // sent to the remote machine.
+        self.approvals.check(name)?;
         match name {
             "rt_info" => self.json(self.client.info().await),
             "rt_exec" => self.exec(args).await,
@@ -335,8 +369,20 @@ impl Bridge {
             }
             "rt_fs_write" => {
                 let path = req_str(args, "path")?;
+                // S-18: never decode an unbounded base64 blob into memory. The
+                // streaming upload path (`rt_fs_upload`) exists for big files.
                 let data = match arg_str(args, "content_b64") {
-                    Some(b64) => base64_decode(&b64)?,
+                    Some(b64) => {
+                        let decoded_len = b64.len() / 4 * 3;
+                        if decoded_len > MAX_INLINE_WRITE_BYTES {
+                            return Err(format!(
+                                "content_b64 is about {decoded_len} bytes, over the \
+                                 {MAX_INLINE_WRITE_BYTES}-byte inline limit; write the file locally \
+                                 and use rt_fs_upload (streaming) instead"
+                            ));
+                        }
+                        base64_decode(&b64)?
+                    }
                     None => req_str(args, "content")?.into_bytes(),
                 };
                 let overwrite = arg_bool(args, "overwrite").unwrap_or(false);
@@ -478,18 +524,14 @@ impl Bridge {
 
     async fn download(&self, args: &Value) -> Result<Value, String> {
         let path = req_str(args, "path")?;
-        let local = match arg_str(args, "local_path") {
-            Some(p) => PathBuf::from(p),
-            None => {
-                let dir = std::env::var("RT_DOWNLOAD_DIR")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-                let name = rt_core::util::sanitize_filename(
-                    path.rsplit(['\\', '/']).next().unwrap_or("download.bin"),
-                );
-                unique_path(&dir, &name)
-            }
-        };
+        let default_name = rt_core::util::sanitize_filename(
+            path.rsplit(['\\', '/']).next().unwrap_or("download.bin"),
+        );
+        let local = resolve_local_target(
+            arg_str(args, "local_path"),
+            "RT_DOWNLOAD_DIR",
+            || default_name.clone(),
+        )?;
         let bytes = self
             .client
             .download_to(&path, &local)
@@ -550,17 +592,12 @@ impl Bridge {
             .ok_or_else(|| "capture payload is not valid base64".to_string())?;
         let meta = response.meta.clone();
 
-        let local = match arg_str(args, "local_path") {
-            Some(p) => PathBuf::from(p),
-            None => {
-                let dir = std::env::var("RT_CAPTURE_DIR")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|_| {
-                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-                    });
+        let local = {
+            let extension = meta.format.extension().to_string();
+            resolve_local_target(arg_str(args, "local_path"), "RT_CAPTURE_DIR", || {
                 let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S-%3f");
-                unique_path(&dir, &format!("capture-{stamp}.{}", meta.format.extension()))
-            }
+                format!("capture-{stamp}.{extension}")
+            })?
         };
         if let Some(parent) = local.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
@@ -683,6 +720,84 @@ fn unique_path(dir: &Path, name: &str) -> PathBuf {
     }
     candidate
 }
+
+/// Makes `path` absolute and resolves `.`/`..` without touching the filesystem,
+/// so a sandbox check sees the path the OS would actually use.
+fn normalize_absolute(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    let mut out = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Case-insensitive containment check on normalised absolute paths.
+fn is_within(root: &Path, candidate: &Path) -> bool {
+    let root = root.to_string_lossy().to_lowercase();
+    let candidate = candidate.to_string_lossy().to_lowercase();
+    if candidate == root {
+        return true;
+    }
+    let with_sep = if root.ends_with('\\') {
+        root.clone()
+    } else {
+        format!("{root}\\")
+    };
+    candidate.starts_with(&with_sep) || candidate.starts_with(&root.replace('\\', "/"))
+}
+
+/// Root directory that locally written files must stay inside (S-19).
+///
+/// Defaults to the process working directory so behaviour stays predictable,
+/// and can be pointed at a dedicated folder with `RT_DOWNLOAD_DIR` /
+/// `RT_CAPTURE_DIR`.
+fn local_sandbox(var: &str) -> PathBuf {
+    match std::env::var_os(var) {
+        Some(value) if !value.is_empty() => normalize_absolute(Path::new(&value)),
+        _ => normalize_absolute(
+            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        ),
+    }
+}
+
+/// Resolves the `local_path` argument, refusing anything outside [`local_sandbox`].
+fn resolve_local_target(
+    raw: Option<String>,
+    var: &str,
+    default_name: impl FnOnce() -> String,
+) -> Result<PathBuf, String> {
+    let root = local_sandbox(var);
+    let candidate = match raw {
+        Some(value) if !value.trim().is_empty() => normalize_absolute(Path::new(value.trim())),
+        _ => unique_path(&root, &default_name()),
+    };
+    if !is_within(&root, &candidate) {
+        return Err(format!(
+            "local_path must stay inside {var} ({}) but {} is outside it; \
+             set {var} to a wider directory if that is really intended",
+            root.display(),
+            candidate.display()
+        ));
+    }
+    Ok(candidate)
+}
+
+/// Inline (`content_b64`) writes above this size must use streaming upload (S-18).
+const MAX_INLINE_WRITE_BYTES: usize = 64 * 1024 * 1024;
+
 
 #[cfg(test)]
 mod tests {

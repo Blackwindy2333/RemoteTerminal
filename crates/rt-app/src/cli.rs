@@ -83,6 +83,26 @@ pub enum Command {
         timeout: u64,
     },
 
+    /// Grant, list or revoke time-boxed leases for destructive MCP tools.
+    ///
+    /// The MCP bridge refuses `rt_exec`, `rt_fs_write`, `rt_fs_delete`,
+    /// `rt_fs_rename`, `rt_fs_copy` and `rt_fs_upload` unless the operator has
+    /// approved them; a lease expires on its own so a forgotten approval does
+    /// not stay dangerous forever.
+    Approve {
+        /// Tool to approve or revoke, for example `rt_exec`.
+        tool: Option<String>,
+        /// Lease length in minutes.
+        #[arg(long, default_value_t = 30)]
+        minutes: u64,
+        /// Show the current leases instead of changing anything.
+        #[arg(long)]
+        list: bool,
+        /// Drop the lease for `tool`.
+        #[arg(long)]
+        revoke: bool,
+    },
+
     /// Run a command on a remote server (uses the CLI credentials).
     Exec {
         /// Command to execute; joined with spaces unless `--raw` is used.
@@ -147,6 +167,7 @@ impl Command {
             Command::HashPassword { .. } => "hash-password",
             Command::GenKey { .. } => "gen-key",
             Command::Fingerprint { .. } => "fingerprint",
+            Command::Approve { .. } => "approve",
             Command::Exec { .. } => "exec",
             Command::Info { .. } => "info",
         }
