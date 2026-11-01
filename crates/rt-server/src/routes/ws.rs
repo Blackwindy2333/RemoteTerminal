@@ -420,6 +420,35 @@ async fn run_socket(state: Arc<AppState>, ctx: SessionContext, socket: WebSocket
     tracing::info!(target: "ws", user = %ctx.username, "websocket disconnected");
 }
 
+/// Characters of a command kept verbatim in the WS audit records.
+const AUDIT_COMMAND_HEAD: usize = 200;
+
+/// Audit summary of a command: a readable head plus a digest of the whole text.
+fn audit_command(command: &str) -> String {
+    format!(
+        "cmd={} sha256={}",
+        truncate(command, AUDIT_COMMAND_HEAD),
+        rt_core::crypto::sha256_hex(command.as_bytes())
+    )
+}
+
+/// Records the intent to run a command; a failed write refuses the request when
+/// the deployment asked for a fail-closed audit trail (`S-25`).
+fn audit_exec_start(
+    state: &AppState,
+    ctx: &SessionContext,
+    request: &ExecRequest,
+) -> Result<(), RtError> {
+    state
+        .record_audit_required(
+            ctx.audit("exec.start", "accepted")
+                .target(request.shell.display_name())
+                .detail(format!("{} via=ws", audit_command(&request.command)))
+                .request_id(ctx.request_id.clone()),
+        )
+        .map_err(|err| RtError::Unavailable(err.message().to_string()))
+}
+
 /// Queues one error frame; ignores send failures (the peer is gone anyway).
 fn send_error(out: &Outbound, id: Option<u64>, err: RtError) {
     let _ = out.send(WsServerMessage::error(id, api_detail(err)));
@@ -436,6 +465,9 @@ fn start_exec(
     if let Err(message) = request.validate() {
         return Err(RtError::bad_request(message));
     }
+    // Record the intent before anything runs: with `logging.audit_fail_closed`
+    // set, a command that cannot be audited must not start.
+    audit_exec_start(state, ctx, &request)?;
     let guard = state.guard(ctx.scope)?;
     let limits = state.exec_limits();
     let slots = state.exec_slots();
@@ -530,16 +562,18 @@ fn start_exec(
                     stdout_tail: non_empty(&stdout_tail),
                     stderr_tail: non_empty(&stderr_tail),
                 });
-                state.record_audit(
+                if let Err(err) = state.record_audit_required(
                     ctx.audit("exec.run", "success")
                         .target(full.shell.clone())
                         .detail(format!(
-                            "exit={} cmd={} via=ws",
+                            "exit={} {} via=ws",
                             summary.exit_code,
-                            truncate(&audit_request.command, 400)
+                            audit_command(&audit_request.command)
                         ))
                         .request_id(ctx.request_id.clone()),
-                );
+                ) {
+                    let _ = out.send(WsServerMessage::error(Some(id), err.into_detail()));
+                }
                 tracing::info!(
                     target: "exec",
                     user = %ctx.username,
@@ -552,7 +586,11 @@ fn start_exec(
             Err(err) => {
                 state.record_audit(
                     ctx.audit("exec.run", "failure")
-                        .detail(format!("{} cmd={} via=ws", err.public_message(), truncate(&audit_request.command, 400)))
+                        .detail(format!(
+                            "{} {} via=ws",
+                            err.public_message(),
+                            audit_command(&audit_request.command)
+                        ))
                         .request_id(ctx.request_id.clone()),
                 );
                 send_error(&out, Some(id), err);

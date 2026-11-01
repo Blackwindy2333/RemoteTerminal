@@ -25,7 +25,7 @@ use rt_protocol::ws::{LogEvent, WsInfo, WS_PATH};
 use rt_protocol::{AppInfo, Scope, ServerInfo, SessionInfo};
 use tokio::sync::Semaphore;
 
-use crate::middleware::ApiResult;
+use crate::middleware::{ApiErr, ApiResult};
 
 /// Lifetime of a WebSocket upgrade ticket.
 ///
@@ -635,19 +635,82 @@ impl AppState {
     }
 
     /// Writes an audit event to the JSONL trail and/or the tracing mirror.
+    ///
+    /// This is the best-effort form used by read paths: an audit failure never
+    /// changes the answer the caller gets.
     pub(crate) fn record_audit(&self, event: AuditEvent) {
         match &self.audit {
             Some(log) => log.log(event),
-            None => tracing::info!(
-                target: "audit",
-                action = %event.action,
-                result = %event.result,
-                user = event.username.as_deref().unwrap_or("-"),
-                target = event.target.as_deref().unwrap_or("-"),
-                detail = event.detail.as_deref().unwrap_or("-"),
-                "audit event"
-            ),
+            None => Self::mirror_audit(&event),
         }
+    }
+
+    /// Writes an audit event that must reach the trail before the action counts
+    /// as accepted (`S-25`).
+    ///
+    /// Mutating handlers call this so a deployment with
+    /// `logging.audit_fail_closed = true` never reports success for an action
+    /// that left no audit record; the request is answered with `503` instead.
+    /// Read paths keep using [`Self::record_audit`].
+    pub(crate) fn record_audit_required(&self, event: AuditEvent) -> Result<(), ApiErr> {
+        Self::gate_audit(self.audit.as_deref(), event, |log, event| {
+            log.log_checked(event)
+        })
+    }
+
+    /// Classifies one audit write: mandatory under fail-closed, best-effort otherwise.
+    ///
+    /// `write` is the checked append. Taking it as an argument keeps the policy
+    /// (which failures block a request) testable without fabricating disk
+    /// errors, which an already-open append handle does not reliably produce.
+    fn gate_audit(
+        log: Option<&AuditLog>,
+        event: AuditEvent,
+        write: impl FnOnce(&AuditLog, AuditEvent) -> Result<()>,
+    ) -> Result<(), ApiErr> {
+        let Some(log) = log else {
+            // No audit file configured: the tracing mirror is the trail.
+            Self::mirror_audit(&event);
+            return Ok(());
+        };
+        if !log.fail_closed() {
+            // Best-effort deployments keep the fire-and-forget contract.
+            log.log(event);
+            return Ok(());
+        }
+        match write(log, event) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                tracing::error!(
+                    target: "audit",
+                    failures = log.failures(),
+                    "audit write failed while fail-closed is enabled: {err}"
+                );
+                Err(Self::audit_unavailable())
+            }
+        }
+    }
+
+    /// Answer for a mutating request whose audit record could not be written.
+    fn audit_unavailable() -> ApiErr {
+        ApiErr::new(
+            rt_protocol::error::ErrorCode::Unavailable,
+            "audit log is unavailable and fail-closed is enabled",
+        )
+        .with_retry_after(1)
+    }
+
+    /// Emits the tracing mirror used when no audit file is configured.
+    fn mirror_audit(event: &AuditEvent) {
+        tracing::info!(
+            target: "audit",
+            action = %event.action,
+            result = %event.result,
+            user = event.username.as_deref().unwrap_or("-"),
+            target = event.target.as_deref().unwrap_or("-"),
+            detail = event.detail.as_deref().unwrap_or("-"),
+            "audit event"
+        );
     }
 
     /// Execution ceilings derived from `[server]`.
@@ -883,6 +946,84 @@ fn highest_scope(config: &Config) -> Scope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A log opened with the requested failure policy, for the audit tests.
+    fn audit_log(dir: &tempfile::TempDir, fail_closed: bool) -> AuditLog {
+        let path = dir.path().join("logs").join("audit.jsonl");
+        std::fs::create_dir_all(path.parent().expect("audit parent")).expect("log dir");
+        AuditLog::open_with(&path, 4, fail_closed).expect("audit log")
+    }
+
+    fn event() -> AuditEvent {
+        AuditEvent::new("fs.mkdir", "success").user("admin")
+    }
+
+    #[test]
+    fn checked_audit_answers_unavailable_when_the_write_fails() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = audit_log(&dir, true);
+
+        let failure = AppState::gate_audit(Some(&log), event(), |_, _| {
+            Err(RtError::Io {
+                path: None,
+                source: std::io::Error::other("disk on fire"),
+            })
+        })
+        .expect_err("fail-closed auditing must reject the request");
+
+        assert_eq!(failure.status(), 503);
+        assert_eq!(
+            failure.message(),
+            "audit log is unavailable and fail-closed is enabled"
+        );
+        assert_eq!(
+            failure.into_detail().retry_after_secs,
+            Some(1),
+            "a shed request tells the client when to retry"
+        );
+    }
+
+    #[test]
+    fn checked_audit_passes_when_the_write_lands() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = audit_log(&dir, true);
+
+        let mut called = false;
+        AppState::gate_audit(Some(&log), event(), |log, event| {
+            called = true;
+            log.log_checked(event)
+        })
+        .expect("a working trail must not block the request");
+        assert!(called);
+        assert_eq!(log.failures(), 0);
+    }
+
+    #[test]
+    fn best_effort_audit_never_blocks_the_request() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let log = audit_log(&dir, false);
+
+        let mut called = false;
+        AppState::gate_audit(Some(&log), event(), |_, _| {
+            called = true;
+            Err(RtError::Internal("disk on fire".to_string()))
+        })
+        .expect("best-effort auditing must never fail a request");
+        // The checked append is skipped entirely: the historical fire-and-forget
+        // contract is preserved.
+        assert!(!called);
+    }
+
+    #[test]
+    fn auditing_without_a_trail_falls_back_to_tracing() {
+        let mut called = false;
+        AppState::gate_audit(None, event(), |_, _| {
+            called = true;
+            Ok(())
+        })
+        .expect("no audit file means the tracing mirror is the trail");
+        assert!(!called);
+    }
 
     #[test]
     fn read_budget_blocks_a_session_and_resets_after_the_window() {

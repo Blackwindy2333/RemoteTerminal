@@ -95,6 +95,11 @@ impl ApiErr {
         &self.0.error.message
     }
 
+    /// Consumes the error into the wire-level detail websocket frames carry.
+    pub(crate) fn into_detail(self) -> rt_protocol::error::ApiErrorDetail {
+        self.0.error
+    }
+
     /// HTTP status this error will be answered with.
     #[cfg(test)]
     pub(crate) fn status(&self) -> u16 {

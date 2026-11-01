@@ -240,7 +240,8 @@
               "application/json": { "schema": { "$ref": "#/components/schemas/FsEntry" } }
             }
           },
-          "409": { "$ref": "#/components/responses/Conflict" }
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "503": { "$ref": "#/components/responses/Unavailable" }
         }
       }
     },
@@ -260,7 +261,8 @@
             "content": {
               "application/json": { "schema": { "$ref": "#/components/schemas/DeleteResult" } }
             }
-          }
+          },
+          "503": { "$ref": "#/components/responses/Unavailable" }
         }
       }
     },
@@ -281,7 +283,8 @@
               "application/json": { "schema": { "$ref": "#/components/schemas/Ack" } }
             }
           },
-          "409": { "$ref": "#/components/responses/Conflict" }
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "503": { "$ref": "#/components/responses/Unavailable" }
         }
       }
     },
@@ -301,7 +304,8 @@
             "content": {
               "application/json": { "schema": { "$ref": "#/components/schemas/WriteResult" } }
             }
-          }
+          },
+          "503": { "$ref": "#/components/responses/Unavailable" }
         }
       }
     },
@@ -365,7 +369,8 @@
             }
           },
           "409": { "$ref": "#/components/responses/Conflict" },
-          "413": { "$ref": "#/components/responses/PayloadTooLarge" }
+          "413": { "$ref": "#/components/responses/PayloadTooLarge" },
+          "503": { "$ref": "#/components/responses/Unavailable" }
         }
       }
     },
@@ -397,7 +402,8 @@
               "application/json": { "schema": { "$ref": "#/components/schemas/WriteResult" } }
             }
           },
-          "415": { "$ref": "#/components/responses/UnsupportedMediaType" }
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" },
+          "503": { "$ref": "#/components/responses/Unavailable" }
         }
       }
     },
@@ -635,7 +641,7 @@
       "UnsupportedMediaType": { "$ref": "#/components/responses/Envelope" },
       "RangeNotSatisfiable": { "$ref": "#/components/responses/Envelope" },
       "RateLimited": { "$ref": "#/components/responses/Envelope" },
-      "Unavailable": { "$ref": "#/components/responses/Envelope" },
+      "Unavailable": { "description": "The action could not be accepted: the server is busy, shutting down, or a fail-closed audit trail could not record the change" },
       "Timeout": { "$ref": "#/components/responses/Envelope" },
       "Envelope": {
         "description": "Error envelope; the HTTP status follows the error code",

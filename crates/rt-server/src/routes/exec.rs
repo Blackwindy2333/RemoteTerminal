@@ -48,6 +48,14 @@ pub(crate) async fn run(
     })?;
     let summary = body.clone();
     let shell_label = body.shell.display_name().to_string();
+    // Record the intent first: with `logging.audit_fail_closed = true` a command
+    // that cannot be audited must not run at all.
+    state.record_audit_required(
+        ctx.audit("exec.start", "accepted")
+            .target(shell_label.clone())
+            .detail(audit_command(&summary.command))
+            .request_id(request_id.clone()),
+    )?;
 
     let result = state
         .spawn_blocking_admitted(move || {
@@ -58,7 +66,7 @@ pub(crate) async fn run(
 
     match &result {
         Ok(out) => {
-            state.record_audit(
+            state.record_audit_required(
                 ctx.audit("exec.run", "success")
                     .target(shell_label.clone())
                     .detail(format!(
@@ -67,7 +75,7 @@ pub(crate) async fn run(
                         audit_command(&summary.command)
                     ))
                     .request_id(request_id.clone()),
-            );
+            )?;
             tracing::info!(
                 target: "exec",
                 user = %ctx.username,
@@ -78,6 +86,8 @@ pub(crate) async fn run(
             );
         }
         Err(err) => {
+            // The command failed before changing anything, so a missing audit
+            // record must not replace the (more useful) execution error.
             state.record_audit(
                 ctx.audit("exec.run", "failure")
                     .target(shell_label)

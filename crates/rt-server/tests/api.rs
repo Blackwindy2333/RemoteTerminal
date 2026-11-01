@@ -56,6 +56,11 @@ impl Fixture {
         Self::build(|_| {}, true)
     }
 
+    /// Fixture with an audit trail opened using the tweaked logging policy.
+    fn audited(tweak: impl FnOnce(&mut Config)) -> Self {
+        Self::build(tweak, true)
+    }
+
     fn build(tweak: impl FnOnce(&mut Config), with_audit: bool) -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
         let workspace = dir.path().join("workspace");
@@ -94,9 +99,12 @@ impl Fixture {
 
         let paths = ResolvedPaths::resolve(&config, dir.path());
         let audit_file = with_audit.then(|| dir.path().join("logs").join("audit.jsonl"));
+        let fail_closed = config.logging.audit_fail_closed;
         let audit = audit_file.as_ref().map(|path| {
             std::fs::create_dir_all(path.parent().expect("audit parent")).expect("log dir");
-            Arc::new(AuditLog::open(path).expect("audit log"))
+            Arc::new(
+                AuditLog::open_with(path, 8, fail_closed).expect("audit log"),
+            )
         });
         let state = AppState::new(ServerOptions {
             config,
@@ -1549,6 +1557,45 @@ async fn command_audit_keeps_a_head_and_a_digest() {
 }
 
 #[tokio::test]
+async fn exec_records_the_intent_before_the_command_runs() {
+    let fx = Fixture::with_audit();
+    let token = fx.token("admin").await;
+    let command = "echo rt-start";
+
+    let (status, _, body) = split(
+        fx.call(authed_json(
+            Method::POST,
+            "/api/v1/exec",
+            &token,
+            serde_json::json!({"shell": {"kind": "cmd"}, "command": command}),
+        ))
+        .await,
+    )
+    .await;
+    assert!(
+        status == StatusCode::OK || status == StatusCode::NOT_IMPLEMENTED,
+        "unexpected status {status}: {body}"
+    );
+
+    let path = fx.audit_file.clone().expect("audit trail");
+    let records = audit_records(&path);
+    let started = records
+        .iter()
+        .find(|record| record["action"] == "exec.start")
+        .expect("exec.start must be audited before the command runs");
+    assert_eq!(started["result"], "accepted");
+    let detail = started["detail"].as_str().unwrap_or_default();
+    assert!(detail.contains(&format!("cmd={command}")), "{detail}");
+    assert!(
+        detail.contains(&format!(
+            "sha256={}",
+            rt_core::crypto::sha256_hex(command.as_bytes())
+        )),
+        "{detail}"
+    );
+}
+
+#[tokio::test]
 async fn long_commands_are_truncated_but_still_verifiable() {
     let fx = Fixture::with_audit();
     let token = fx.token("admin").await;
@@ -1588,5 +1635,101 @@ async fn long_commands_are_truncated_but_still_verifiable() {
     assert!(
         detail.contains(&format!("sha256={digest}")),
         "the digest must cover the untruncated command: {detail}"
+    );
+}
+
+/// Reads every audit record written to a fixture's trail.
+fn audit_records(path: &std::path::Path) -> Vec<Value> {
+    std::fs::read_to_string(path)
+        .expect("read audit trail")
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect()
+}
+
+#[tokio::test]
+async fn fail_closed_auditing_still_serves_a_working_trail() {
+    let fx = Fixture::audited(|cfg| cfg.logging.audit_fail_closed = true);
+    let token = fx.token("worker").await;
+
+    // A mutation whose record lands is reported as successful.
+    let mkdir = authed_json(
+        Method::POST,
+        "/api/v1/fs/mkdir",
+        &token,
+        serde_json::json!({ "path": "closed" }),
+    );
+    let (status, _, body) = split(fx.call(mkdir).await).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // A mutation that failed keeps its own error: the audit policy must not
+    // replace a useful failure with a shed-request answer.
+    let again = authed_json(
+        Method::POST,
+        "/api/v1/fs/mkdir",
+        &token,
+        serde_json::json!({ "path": "closed" }),
+    );
+    let (status, _, body) = split(fx.call(again).await).await;
+    assert_ne!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(status.is_client_error(), "unexpected status {status}: {body}");
+
+    // Writes and reads keep working with fail-closed auditing enabled.
+    let write = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/fs/write?path=note.txt")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from("audited"))
+        .expect("request");
+    let (status, _, body) = split(fx.call(write).await).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, _, body) = split(
+        fx.call(authed_get("/api/v1/fs/read?path=note.txt", &token))
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["text"], "audited");
+
+    let records = audit_records(fx.audit_file.as_deref().expect("audit trail"));
+    assert!(
+        records
+            .iter()
+            .any(|record| record["action"] == "fs.mkdir" && record["result"] == "success"),
+        "the mutation must be on the trail"
+    );
+    assert!(
+        records.iter().any(|record| record["action"] == "fs.write"),
+        "the write must be on the trail"
+    );
+}
+
+#[tokio::test]
+async fn best_effort_auditing_answers_normally() {
+    let fx = Fixture::with_audit();
+    assert!(!fx.state.config().logging.audit_fail_closed);
+    let token = fx.token("worker").await;
+
+    let mkdir = authed_json(
+        Method::POST,
+        "/api/v1/fs/mkdir",
+        &token,
+        serde_json::json!({ "path": "open" }),
+    );
+    let (status, _, body) = split(fx.call(mkdir).await).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, _, body) = split(
+        fx.call(authed_get("/api/v1/fs/list?path=", &token)).await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let records = audit_records(fx.audit_file.as_deref().expect("audit trail"));
+    assert!(
+        records.iter().any(|record| record["action"] == "fs.mkdir"),
+        "best-effort auditing still writes the trail"
     );
 }

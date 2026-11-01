@@ -18,6 +18,7 @@ use tokio_util::io::ReaderStream;
 
 use rt_core::fsops;
 use rt_core::pathscope::PathGuard;
+use rt_core::logging::AuditEvent;
 use rt_core::util;
 use rt_core::{RtError, SessionContext};
 use rt_protocol::error::{ApiErrorBody, ErrorCode};
@@ -126,7 +127,7 @@ pub(crate) async fn mkdir(
     let target = body.path.clone();
     let guard = state.guard(ctx.scope)?;
     let result = state.spawn_blocking_admitted(move || fsops::mkdir(&guard, &body)).await;
-    audit_fs(&state, &ctx, "fs.mkdir", &target, result.as_ref().err(), None, &request_id);
+    audit_fs_required(&state, &ctx, "fs.mkdir", &target, result.as_ref().err(), None, &request_id)?;
     Ok(Json(result?))
 }
 
@@ -142,7 +143,7 @@ pub(crate) async fn delete(
     let target = body.paths.join(", ");
     let guard = state.guard(ctx.scope)?;
     let result = state.spawn_blocking_admitted(move || fsops::delete(&guard, &body)).await;
-    audit_fs(&state, &ctx, "fs.delete", &target, result.as_ref().err(), None, &request_id);
+    audit_fs_required(&state, &ctx, "fs.delete", &target, result.as_ref().err(), None, &request_id)?;
     Ok(Json(result?))
 }
 
@@ -158,7 +159,7 @@ pub(crate) async fn rename(
     let target = format!("{} -> {}", body.from, body.to);
     let guard = state.guard(ctx.scope)?;
     let result = state.spawn_blocking_admitted(move || fsops::rename(&guard, &body)).await;
-    audit_fs(&state, &ctx, "fs.rename", &target, result.as_ref().err(), None, &request_id);
+    audit_fs_required(&state, &ctx, "fs.rename", &target, result.as_ref().err(), None, &request_id)?;
     result?;
     Ok(Json(Ack::with_message("renamed")))
 }
@@ -175,7 +176,7 @@ pub(crate) async fn copy(
     let target = format!("{} -> {}", body.from, body.to);
     let guard = state.guard(ctx.scope)?;
     let result = state.spawn_blocking_admitted(move || fsops::copy(&guard, &body)).await;
-    audit_fs(&state, &ctx, "fs.copy", &target, result.as_ref().err(), None, &request_id);
+    audit_fs_required(&state, &ctx, "fs.copy", &target, result.as_ref().err(), None, &request_id)?;
     Ok(Json(result?))
 }
 
@@ -426,7 +427,7 @@ pub(crate) async fn write(
     writer.finish();
 
     let result = join_writer(task).await;
-    audit_fs(
+    audit_fs_required(
         &state,
         &ctx,
         "fs.write",
@@ -434,7 +435,7 @@ pub(crate) async fn write(
         result.as_ref().err(),
         Some(format!("{received} bytes uploaded")),
         &request_id,
-    );
+    )?;
     Ok(Json(result?))
 }
 
@@ -524,7 +525,7 @@ pub(crate) async fn upload(
         writer.finish();
 
         let result = join_writer(task).await;
-        audit_fs(
+        audit_fs_required(
             &state,
             &ctx,
             "fs.upload",
@@ -532,7 +533,7 @@ pub(crate) async fn upload(
             result.as_ref().err(),
             Some(format!("{received} bytes uploaded")),
             &req_id_ext.0,
-        );
+        )?;
         return Ok(Json(result?));
     }
 }
@@ -681,16 +682,15 @@ fn join_display(dir: &str, name: &str) -> String {
     format!("{trimmed}\\{name}")
 }
 
-/// Records one filesystem operation in the audit trail.
-fn audit_fs(
-    state: &AppState,
+/// Builds the audit record for one filesystem operation.
+fn audit_fs_event(
     ctx: &SessionContext,
     action: &str,
     target: &str,
     outcome: Option<&ApiErr>,
     extra: Option<String>,
     request_id: &str,
-) {
+) -> AuditEvent {
     let event = match outcome {
         Some(_) => ctx.audit(action, "failure"),
         None => ctx.audit(action, "success"),
@@ -702,5 +702,41 @@ fn audit_fs(
         (None, Some(extra)) => event.detail(extra),
         (None, None) => event,
     };
-    state.record_audit(event.request_id(request_id));
+    event.request_id(request_id)
+}
+
+/// Records one filesystem operation best-effort (read paths and failures).
+fn audit_fs(
+    state: &AppState,
+    ctx: &SessionContext,
+    action: &str,
+    target: &str,
+    outcome: Option<&ApiErr>,
+    extra: Option<String>,
+    request_id: &str,
+) {
+    let event = audit_fs_event(ctx, action, target, outcome, extra, request_id);
+    state.record_audit(event);
+}
+
+/// Records a completed mutation, refusing the request when the deployment
+/// asked for a fail-closed audit trail and the record could not be written.
+///
+/// A failed operation did not change anything, so its own error wins over an
+/// audit failure: only the success path can answer `503`.
+fn audit_fs_required(
+    state: &AppState,
+    ctx: &SessionContext,
+    action: &str,
+    target: &str,
+    outcome: Option<&ApiErr>,
+    extra: Option<String>,
+    request_id: &str,
+) -> ApiResult<()> {
+    let event = audit_fs_event(ctx, action, target, outcome, extra, request_id);
+    if outcome.is_some() {
+        state.record_audit(event);
+        return Ok(());
+    }
+    state.record_audit_required(event)
 }
