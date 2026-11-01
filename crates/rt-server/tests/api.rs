@@ -62,6 +62,12 @@ impl Fixture {
     }
 
     fn build(tweak: impl FnOnce(&mut Config), with_audit: bool) -> Self {
+        let _guard = env_lock();
+        Self::build_locked(tweak, with_audit)
+    }
+
+    /// Builds a fixture while the caller already holds [`env_lock`].
+    fn build_locked(tweak: impl FnOnce(&mut Config), with_audit: bool) -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
         let workspace = dir.path().join("workspace");
         std::fs::create_dir_all(&workspace).expect("create workspace");
@@ -147,6 +153,21 @@ impl Fixture {
             .expect("access_token in login response")
             .to_string()
     }
+}
+
+/// Serialises fixture construction with the read-budget override.
+///
+/// `RT_READ_BUDGET_BYTES` is process-wide and is read when a fixture's
+/// [`AppState`] is built, so two fixtures must never be constructed while the
+/// override is set for one of them.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Takes the fixture/override lock, ignoring poisoning (a panicking test must
+/// not wedge every later test in the binary).
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Runs one request through a router, defaulting `Host` to the mocked listener.
@@ -495,6 +516,126 @@ async fn write_read_and_ranged_download_roundtrip() {
     assert!(disposition.contains("hello.txt"), "{disposition}");
     let bytes = to_bytes(res.into_body(), 1024).await.expect("body");
     assert_eq!(&bytes[..], b"ranged");
+}
+
+#[tokio::test]
+async fn streamed_downloads_are_not_charged_against_the_inline_read_budget() {
+    // Regression test: downloads used to be charged their whole remaining
+    // length against the per-session read budget, so with the 512 MiB default
+    // any file above that size could never be downloaded and resumable
+    // transfers hit 429. The budget now only covers inline previews.
+    const BUDGET_ENV: &str = "RT_READ_BUDGET_BYTES"; // `state::READ_BUDGET_ENV`
+    const BUDGET_BYTES: &str = "4096";
+    let payload: Vec<u8> = (0..128 * 1024).map(|i| (i % 251) as u8).collect();
+    let file_len = payload.len() as u64;
+
+    // The override is process-wide, so set it, build the only fixture that
+    // should see it, and clear it again before any await.
+    let fx = {
+        let guard = env_lock();
+        std::env::set_var(BUDGET_ENV, BUDGET_BYTES);
+        let fx = Fixture::build_locked(|_| {}, false);
+        std::env::remove_var(BUDGET_ENV);
+        drop(guard);
+        fx
+    };
+    let token = fx.token("worker").await;
+
+    let req = with_token(
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/fs/write?path=resume.bin&overwrite=true"),
+        &token,
+    )
+    .header(header::CONTENT_TYPE, "application/octet-stream")
+    .body(Body::from(payload.clone()))
+    .expect("request");
+    let (status, _, body) = split(fx.call(req).await).await;
+    assert!(status.is_success(), "write failed with {status}: {body}");
+    assert_eq!(body["size"], file_len);
+
+    // 1. The whole 128 KiB file streams out even though the inline budget is
+    //    4 KiB: this is what the bug report broke.
+    let res = fx
+        .call(authed_get("/api/v1/fs/download?path=resume.bin", &token))
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "a streamed download must not be rejected by the inline read budget"
+    );
+    assert_eq!(
+        res.headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        Some(file_len.to_string().as_str())
+    );
+    let bytes = to_bytes(res.into_body(), BODY_LIMIT)
+        .await
+        .expect("download body");
+    assert_eq!(bytes.len() as u64, file_len, "download must be complete");
+    assert_eq!(&bytes[..], &payload[..], "download bytes must match");
+
+    // 2. Inline previews stay bounded: 2 KiB requests must run the 4 KiB
+    //    budget dry and answer 429 with a retry hint.
+    let mut throttled = None;
+    for attempt in 1..=4 {
+        let (status, headers, body) = split(
+            fx.call(authed_get(
+                "/api/v1/fs/read?path=resume.bin&length=2048",
+                &token,
+            ))
+            .await,
+        )
+        .await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            throttled = Some((attempt, headers, body));
+            break;
+        }
+        assert_eq!(status, StatusCode::OK, "inline read {attempt}: {body}");
+    }
+    let (attempt, headers, body) =
+        throttled.expect("inline reads must exhaust the 4 KiB read budget");
+    assert!(
+        matches!(attempt, 2 | 3),
+        "two 2 KiB previews fill a 4 KiB budget, but the limit was hit on attempt {attempt}"
+    );
+    assert_eq!(body["error"]["code"], "rate_limited");
+    assert!(
+        body["error"]["retry_after_secs"].as_u64().unwrap_or(0) >= 1,
+        "429 must carry a retry hint: {body}"
+    );
+    assert!(headers.contains_key(header::RETRY_AFTER));
+
+    // 3. A resumed transfer (`Range: bytes=65536-`) is still served even though
+    //    the inline budget is already exhausted.
+    let req = with_token(
+        Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/fs/download?path=resume.bin"),
+        &token,
+    )
+    .header(header::RANGE, "bytes=65536-")
+    .body(Body::empty())
+    .expect("request");
+    let res = fx.call(req).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::PARTIAL_CONTENT,
+        "a resumed download must not be throttled by the inline read budget"
+    );
+    let expected_range = format!("bytes 65536-{}/{file_len}", file_len - 1);
+    assert_eq!(
+        res.headers()
+            .get(header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok()),
+        Some(expected_range.as_str())
+    );
+    let resumed = to_bytes(res.into_body(), BODY_LIMIT)
+        .await
+        .expect("resume body");
+    assert_eq!(resumed.len(), 65_536);
+    assert_eq!(&resumed[..], &payload[65_536..], "resumed bytes must match");
 }
 
 #[tokio::test]

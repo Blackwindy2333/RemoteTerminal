@@ -253,7 +253,6 @@ pub(crate) async fn download(
 ) -> ApiResult<Response> {
     let ctx = session_of(&req)?;
     let request_id = req_id(&req);
-    let budget = crate::middleware::budget_key(&req, &ctx);
     let range_header = req
         .headers()
         .get(header::RANGE)
@@ -304,20 +303,15 @@ pub(crate) async fn download(
 
     let (start, length) = byte_range.bounds(size);
 
-    // Downloads share the per-session read budget with inline previews.
-    if let Err(err) = state.read_budget().charge(&budget, length.max(1)) {
-        let failure = ApiErr::from(err);
-        audit_fs(
-            &state,
-            &ctx,
-            "fs.download",
-            &display_path,
-            Some(&failure),
-            Some(format!("{length} bytes")),
-            &request_id,
-        );
-        return Err(failure);
-    }
+    // Downloads deliberately do not draw on the per-session read budget: that
+    // budget exists to bound how much data a single request materialises in
+    // memory, and this handler streams with `ReaderStream` under HTTP back
+    // pressure, so its footprint is independent of the file size. Charging the
+    // whole remaining length here made every file larger than the per-minute
+    // allowance impossible to download (and re-downloading mid-sized files
+    // hit 429, which broke resumable transfers). Bandwidth is still shaped by
+    // TCP back pressure, the per-IP request rate limit and the blocking-pool
+    // admission budget, and the transfer itself is audited below.
 
     let mut handle = tokio::fs::File::from_std(file);
     if start > 0 {

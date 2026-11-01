@@ -33,11 +33,20 @@ use crate::middleware::{ApiErr, ApiResult};
 /// proxy logs and browser history (SECURITY.md S-24).
 pub const WS_TICKET_TTL_MS: i64 = 15_000;
 
-/// Bytes one session may read (inline reads + downloads) per minute.
+/// Bytes one session may read inline (base64 file previews) per minute.
 ///
-/// Bounds the value of a stolen session token as an exfiltration channel
-/// (SECURITY.md S-09).
+/// Bounds how much data one request materialises in memory, which also bounds
+/// the value of a stolen session token as an exfiltration channel
+/// (SECURITY.md S-09). Streamed downloads are not charged: their footprint does
+/// not grow with the file size (see `routes::fs::download`).
 pub const READ_BUDGET_PER_MINUTE: u64 = 512 * 1024 * 1024;
+
+/// Environment override for [`READ_BUDGET_PER_MINUTE`], in bytes.
+///
+/// Tests need a budget they can exhaust without moving hundreds of megabytes,
+/// and operators may want a different cap without rebuilding; an unparsable
+/// value falls back to the default with a warning.
+pub const READ_BUDGET_ENV: &str = "RT_READ_BUDGET_BYTES";
 
 /// Sliding window the read budget is measured over.
 const READ_BUDGET_WINDOW_MS: i64 = 60_000;
@@ -423,7 +432,7 @@ impl AppState {
                 last_check_ms: auth::now_ms(),
                 signature,
             }),
-            read_budget: ReadBudget::new(READ_BUDGET_PER_MINUTE),
+            read_budget: ReadBudget::new(read_budget_limit()),
             user_throttle: UsernameThrottle::new(),
             started_at_ms: auth::now_ms(),
             started: Instant::now(),
@@ -923,6 +932,30 @@ impl std::fmt::Debug for AppState {
             .field("max_scope", &self.credentials().max_scope)
             .field("uptime_secs", &self.uptime_secs())
             .finish_non_exhaustive()
+    }
+}
+
+/// Resolves the inline read budget, honouring [`READ_BUDGET_ENV`].
+fn read_budget_limit() -> u64 {
+    let Ok(raw) = std::env::var(READ_BUDGET_ENV) else {
+        return READ_BUDGET_PER_MINUTE;
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(bytes) if bytes > 0 => bytes,
+        Ok(_) => {
+            tracing::warn!(
+                target: "server",
+                "{READ_BUDGET_ENV}=0 is not a usable read budget; using {READ_BUDGET_PER_MINUTE} bytes"
+            );
+            READ_BUDGET_PER_MINUTE
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "server",
+                "{READ_BUDGET_ENV}={raw:?} is not a byte count ({err}); using {READ_BUDGET_PER_MINUTE} bytes"
+            );
+            READ_BUDGET_PER_MINUTE
+        }
     }
 }
 

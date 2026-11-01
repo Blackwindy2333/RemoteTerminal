@@ -312,7 +312,7 @@
     "/api/v1/fs/read": {
       "get": {
         "tags": ["fs"],
-        "summary": "Read a byte range as base64 plus decoded text",
+        "summary": "Read a byte range as base64 plus decoded text (charged against the per-session inline read budget)",
         "parameters": [
           { "$ref": "#/components/parameters/PathQuery" },
           { "name": "offset", "in": "query", "schema": { "type": "integer", "minimum": 0 } },
@@ -325,7 +325,8 @@
               "application/json": { "schema": { "$ref": "#/components/schemas/ReadFileResult" } }
             }
           },
-          "413": { "$ref": "#/components/responses/PayloadTooLarge" }
+          "413": { "$ref": "#/components/responses/PayloadTooLarge" },
+          "429": { "$ref": "#/components/responses/RateLimited" }
         }
       }
     },
