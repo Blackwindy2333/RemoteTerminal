@@ -196,6 +196,238 @@ fn volume_space(_real: &Path) -> Option<(u64, u64)> {
 }
 
 // ---------------------------------------------------------------------------
+// Destination capacity
+// ---------------------------------------------------------------------------
+
+/// Free headroom kept on the destination volume by every write and copy.
+///
+/// Without it a large upload could fill the disk and take the whole machine
+/// (audit log included) down with it, well before the per-request upload limit
+/// is reached.
+const SPACE_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// A streamed write re-checks the free space every this many bytes.
+const SPACE_RECHECK_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Free bytes on the volume that holds `target`, straight from Win32.
+fn free_bytes(target: &Path) -> Option<u64> {
+    volume_space(target).map(|(_, free)| free)
+}
+
+/// Refuses a write when the destination volume cannot take `incoming` more
+/// bytes while still keeping [`SPACE_RESERVE_BYTES`] free.
+///
+/// `incoming == None` means the length is unknown (a chunked upload): only the
+/// reserve is required up front, and the stream then re-checks itself every
+/// [`SPACE_RECHECK_BYTES`]. Volumes that cannot report their free space are
+/// trusted, so the check never breaks a working setup.
+fn ensure_capacity(target: &Path, incoming: Option<u64>, shown: &str) -> Result<()> {
+    let Some(free) = free_bytes(target) else {
+        return Ok(());
+    };
+    let need = match incoming {
+        Some(size) => size.saturating_add(SPACE_RESERVE_BYTES),
+        None => SPACE_RESERVE_BYTES,
+    };
+    if free >= need {
+        return Ok(());
+    }
+    Err(RtError::PayloadTooLarge(format!(
+        "not enough free space for `{shown}`: need {need} bytes ({SPACE_RESERVE_BYTES} byte reserve included), but only {free} bytes are free on the destination volume"
+    )))
+}
+
+// ---------------------------------------------------------------------------
+// Handle-level re-validation (path swapping)
+// ---------------------------------------------------------------------------
+//
+// `PathGuard::resolve` canonicalises a path, but the caller then performs the
+// I/O *by name*: a process that can write inside the jail can, during that
+// window, replace a path component with a junction so the later syscall lands
+// outside the jail. Remote clients cannot create links through this API
+// (`write` creates plain files, `mkdir` plain directories, `copy` skips
+// reparse points), so the attacker has to be a local low-privileged account —
+// but the window is real (S-31 in `docs/SECURITY.md`).
+//
+// Every entry point that opens a handle therefore re-checks the *final* path
+// the kernel reports for that handle (`GetFinalPathNameByHandleW`) against the
+// jail root. `delete` cannot hold the handle it deletes through, so it re-runs
+// the canonicalisation immediately before the syscall instead; the microseconds
+// in between remain the documented residual window.
+
+#[cfg(windows)]
+mod winio {
+    //! Minimal `CreateFileW` / `GetFinalPathNameByHandleW` wrapper.
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::path::{Path, PathBuf};
+
+    use crate::pathscope;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateFileW(
+            file_name: *const u16,
+            desired_access: u32,
+            share_mode: u32,
+            security_attributes: *const c_void,
+            creation_disposition: u32,
+            flags_and_attributes: u32,
+            template_file: isize,
+        ) -> isize;
+        fn GetFinalPathNameByHandleW(
+            file: isize,
+            file_path: *mut u16,
+            file_path_len: u32,
+            flags: u32,
+        ) -> u32;
+        fn CloseHandle(object: isize) -> i32;
+    }
+
+    const INVALID_HANDLE_VALUE: isize = -1;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0080;    const SHARE_ALL: u32 = 0x0000_0007;
+    const OPEN_EXISTING: u32 = 3;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    /// Owns a kernel handle and closes it on drop.
+    struct Handle(isize);
+
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            // SAFETY: the handle is valid and owned by this value.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    /// NUL-terminated UTF-16 form of `path`.
+    fn wide(path: &Path) -> Vec<u16> {
+        let mut name: Vec<u16> = pathscope::to_extended(path)
+            .as_os_str()
+            .encode_wide()
+            .collect();
+        name.push(0);
+        name
+    }
+
+    /// Opens attribute-only access, optionally through the last link.
+    fn open(path: &Path, follow_links: bool) -> Option<Handle> {
+        let name = wide(path);
+        let mut flags = FILE_FLAG_BACKUP_SEMANTICS;
+        if !follow_links {
+            flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+        }
+        // SAFETY: `name` is a NUL-terminated UTF-16 buffer that outlives the
+        // call; the remaining arguments are plain constants and null pointers.
+        let raw = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                SHARE_ALL,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                flags,
+                0,
+            )
+        };
+        if raw <= 0 || raw == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        Some(Handle(raw))
+    }
+
+    /// Final path the kernel associates with `raw`, without the `\\?\` prefix.
+    fn final_path(raw: isize) -> Option<PathBuf> {
+        let mut buffer = vec![0u16; 512];
+        loop {
+            // SAFETY: `buffer` is a writable UTF-16 buffer of `buffer.len()`
+            // elements and the handle is valid for the duration of the call.
+            let len = unsafe {
+                GetFinalPathNameByHandleW(raw, buffer.as_mut_ptr(), buffer.len() as u32, 0)
+            } as usize;
+            if len == 0 {
+                return None;
+            }
+            if len < buffer.len() {
+                let text = String::from_utf16_lossy(&buffer[..len]);
+                return Some(pathscope::strip_extended_prefix(Path::new(&text)));
+            }
+            buffer.resize(len + 1, 0);
+        }
+    }
+
+    /// Final path of `path`, or `None` when it cannot be opened.
+    pub(super) fn real_path(path: &Path, follow_links: bool) -> Option<PathBuf> {
+        let handle = open(path, follow_links)?;
+        final_path(handle.0)
+    }
+
+    /// Final path of an already open file.
+    pub(super) fn file_final_path(file: &std::fs::File) -> Option<PathBuf> {
+        final_path(file.as_raw_handle() as isize)
+    }
+}
+
+#[cfg(not(windows))]
+mod winio {
+    //! No-ops off Windows: the jail only exists on Windows.
+    use std::path::{Path, PathBuf};
+
+    pub(super) fn real_path(_path: &Path, _follow_links: bool) -> Option<PathBuf> {
+        None
+    }
+
+    pub(super) fn file_final_path(_file: &std::fs::File) -> Option<PathBuf> {
+        None
+    }
+}
+
+/// Re-checks an already resolved path against the jail using a kernel handle.
+///
+/// `follow_links` must be `false` for entries whose links are about to be
+/// removed as links (the handle then reports the link itself, not its target).
+fn verify_entry(guard: &PathGuard, real: &Path, label: &str, follow_links: bool) -> Result<()> {
+    if guard.root().is_none() {
+        // Full scope has no jail: nothing to enforce here.
+        return Ok(());
+    }
+    match winio::real_path(real, follow_links) {
+        Some(actual) => verify_final_path(guard, &actual, label),
+        // The entry cannot be opened (already gone, unsupported provider): fall
+        // back to re-running the whole canonicalisation instead of giving up.
+        None => revalidate(guard, real, label),
+    }
+}
+
+/// Rejects a kernel-reported final path that sits outside the jail.
+fn verify_final_path(guard: &PathGuard, actual: &Path, label: &str) -> Result<()> {
+    match guard.root() {
+        Some(root) if !pathscope::path_starts_with(actual, root) => {
+            Err(RtError::PolicyDenied(format!(
+                "refusing `{label}`: the entry now resolves to `{}`, outside the workspace root `{}` (a path component was swapped after validation)",
+                actual.display(),
+                root.display()
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Fallback for entries that cannot be opened: canonicalise the path again.
+fn revalidate(guard: &PathGuard, real: &Path, label: &str) -> Result<()> {
+    let again = guard.resolve(real.to_string_lossy().as_ref());
+    match again {
+        Ok(fresh) if pathscope::path_eq(&fresh, real) => Ok(()),
+        _ => Err(RtError::PolicyDenied(format!(
+            "refusing `{label}`: the path could not be re-verified inside the workspace"
+        ))),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Browsing
 // ---------------------------------------------------------------------------
 
@@ -395,6 +627,10 @@ fn delete_one(
 ) -> Result<String> {
     let real = guard.resolve(path)?;
     ensure_deletable(guard, &real)?;
+    // `delete` cannot hold the handle it removes through, so the entry is
+    // re-verified immediately before each syscall; the residual window is the
+    // microseconds in between (see the note on path swapping above).
+    verify_entry(guard, &real, &guard.display(&real), false)?;
     let io_real = io_path(&real);
     let meta = std::fs::symlink_metadata(&io_real).map_err(|e| io_err(&real, e))?;
     let attrs = util::file_attributes(&meta);
@@ -424,7 +660,7 @@ fn delete_one(
                 )));
             }
         } else {
-            remove_children(&io_real, even_if_readonly)?;
+            remove_children(guard, &io_real, even_if_readonly)?;
         }
         if even_if_readonly {
             util::clear_readonly(&io_real)?;
@@ -473,8 +709,9 @@ fn remove_link(path: &Path) -> std::io::Result<()> {
 /// Recursively deletes the *contents* of `dir`, without following links.
 ///
 /// Links are unlinked as-is (removing the link, not its target), which is what
-/// keeps a recursive delete from ever escaping the jail.
-fn remove_children(dir: &Path, clear_ro: bool) -> Result<()> {
+/// keeps a recursive delete from ever escaping the jail; every child is also
+/// re-verified through a handle before it is removed.
+fn remove_children(guard: &PathGuard, dir: &Path, clear_ro: bool) -> Result<()> {
     let reader = std::fs::read_dir(dir).map_err(|e| io_err(dir, e))?;
     // Snapshot first: the enumeration handle must be closed before removing.
     let mut children: Vec<(PathBuf, std::fs::Metadata)> = Vec::new();
@@ -485,6 +722,7 @@ fn remove_children(dir: &Path, clear_ro: bool) -> Result<()> {
         children.push((child, meta));
     }
     for (child, meta) in children {
+        verify_entry(guard, &child, &child.display().to_string(), false)?;
         let attrs = util::file_attributes(&meta);
         if meta.file_type().is_symlink() || util::is_reparse_point(attrs) {
             if clear_ro {
@@ -493,7 +731,7 @@ fn remove_children(dir: &Path, clear_ro: bool) -> Result<()> {
             remove_link(&child).map_err(|e| io_err(&child, e))?;
         } else if meta.is_dir() {
             check_readonly(&child.display().to_string(), attrs, clear_ro)?;
-            remove_children(&child, clear_ro)?;
+            remove_children(guard, &child, clear_ro)?;
             if clear_ro {
                 util::clear_readonly(&child)?;
             }
@@ -550,7 +788,7 @@ pub fn rename(guard: &PathGuard, req: &RenameRequest) -> Result<()> {
         } else if to_meta.is_dir() {
             // `MoveFileEx` replaces files but not directories, so the existing
             // directory has to go first.
-            remove_children(&io_to, true)?;
+            remove_children(guard, &io_to, true)?;
             std::fs::remove_dir(&io_to).map_err(|e| io_err(&to, e))?;
         } else if util::is_readonly(to_attrs) {
             util::clear_readonly(&io_to)?;
@@ -612,6 +850,13 @@ impl CopyState {
     }
 }
 
+/// Copies a file or (with `recursive`) a directory tree.
+///
+/// `overwrite` is honoured exactly, a directory may not be copied into its own
+/// subtree, one request is capped by [`COPY_MAX_TOTAL_BYTES`] and
+/// [`COPY_MAX_ENTRIES`], the destination volume must have room for the source
+/// plus [`SPACE_RESERVE_BYTES`], and both ends are re-verified through handles
+/// (see the note on path swapping above).
 pub fn copy(guard: &PathGuard, req: &CopyRequest) -> Result<WriteResult> {
     copy_with_caps(guard, req, CopyCaps::default())
 }
@@ -649,6 +894,14 @@ fn copy_with_caps(guard: &PathGuard, req: &CopyRequest, caps: CopyCaps) -> Resul
     let target_meta = std::fs::symlink_metadata(&io_to).ok();
     let overwritten = target_meta.is_some();
     let to_label = guard.display(&to);
+    // Estimate the demand on the destination volume before writing anything;
+    // `copy_file` re-checks per file so a growing source cannot bypass it.
+    let incoming = if from_is_dir {
+        tree_bytes(&io_from, caps.max_bytes)?
+    } else {
+        from_meta.len()
+    };
+    ensure_capacity(&to, Some(incoming), &to_label)?;
     let mut state = CopyState {
         bytes: 0,
         entries: 0,
@@ -674,7 +927,14 @@ fn copy_with_caps(guard: &PathGuard, req: &CopyRequest, caps: CopyCaps) -> Resul
                 )));
             }
         }
-        copy_dir_tree(&io_from, &io_to, &to_label, req.overwrite, &mut state)?;
+        copy_dir_tree(
+            guard,
+            &io_from,
+            &io_to,
+            &to_label,
+            req.overwrite,
+            &mut state,
+        )?;
     } else {
         if let Some(meta) = &target_meta {
             if !req.overwrite {
@@ -690,6 +950,7 @@ fn copy_with_caps(guard: &PathGuard, req: &CopyRequest, caps: CopyCaps) -> Resul
         }
         let mut hasher = Sha256::new();
         copy_file(
+            guard,
             &io_from,
             &io_to,
             &to_label,
@@ -717,7 +978,12 @@ fn copy_with_caps(guard: &PathGuard, req: &CopyRequest, caps: CopyCaps) -> Resul
 }
 
 /// Copies one file through a fixed-size buffer, optionally hashing as it goes.
+///
+/// Both ends are re-verified through handles before a byte moves (see the note
+/// on path swapping above) and the destination volume must have room for the
+/// source plus the reserve.
 fn copy_file(
+    guard: &PathGuard,
     from: &Path,
     to: &Path,
     to_label: &str,
@@ -726,6 +992,13 @@ fn copy_file(
     mut hasher: Option<&mut Sha256>,
 ) -> Result<()> {
     if let Ok(meta) = std::fs::symlink_metadata(to) {
+        if meta.file_type().is_symlink() || util::is_reparse_point(util::file_attributes(&meta)) {
+            // `File::create` would truncate the link's target, which may be
+            // anywhere; refuse instead of writing through it.
+            return Err(RtError::PolicyDenied(format!(
+                "refusing to write through the link `{to_label}`"
+            )));
+        }
         if !overwrite {
             return Err(RtError::Conflict(format!(
                 "`{to_label}` already exists (set overwrite=true)"
@@ -740,8 +1013,19 @@ fn copy_file(
             util::clear_readonly(to)?;
         }
     }
+    if let Some(parent) = to.parent() {
+        verify_entry(guard, parent, to_label, true)?;
+    }
     let mut source = std::fs::File::open(from).map_err(|e| io_err(from, e))?;
+    if let Some(actual) = winio::file_final_path(&source) {
+        verify_final_path(guard, &actual, to_label)?;
+    }
+    let source_len = source.metadata().map(|meta| meta.len()).unwrap_or(0);
+    ensure_capacity(to, Some(source_len), to_label)?;
     let mut target = std::fs::File::create(to).map_err(|e| io_err(to, e))?;
+    if let Some(actual) = winio::file_final_path(&target) {
+        verify_final_path(guard, &actual, to_label)?;
+    }
     let mut buf = vec![0u8; COPY_CHUNK];
     loop {
         let read = source.read(&mut buf).map_err(|e| io_err(from, e))?;
@@ -768,6 +1052,7 @@ fn copy_file(
 
 /// Recursively copies a directory tree (links are reported and skipped).
 fn copy_dir_tree(
+    guard: &PathGuard,
     from: &Path,
     to: &Path,
     to_label: &str,
@@ -782,7 +1067,12 @@ fn copy_dir_tree(
                 "`{to_label}` exists and is not a directory"
             )))
         }
-        Err(_) => std::fs::create_dir(to).map_err(|e| io_err(to, e))?,
+        Err(_) => {
+            if let Some(parent) = to.parent() {
+                verify_entry(guard, parent, to_label, true)?;
+            }
+            std::fs::create_dir(to).map_err(|e| io_err(to, e))?;
+        }
     }
 
     let reader = std::fs::read_dir(from).map_err(|e| io_err(from, e))?;
@@ -812,13 +1102,50 @@ fn copy_dir_tree(
             continue;
         }
         if meta.is_dir() {
-            copy_dir_tree(&child, &target, &target_label, overwrite, state)?;
+            copy_dir_tree(guard, &child, &target, &target_label, overwrite, state)?;
         } else {
             state.count_entry()?;
-            copy_file(&child, &target, &target_label, overwrite, state, None)?;
+            copy_file(
+                guard,
+                &child,
+                &target,
+                &target_label,
+                overwrite,
+                state,
+                None,
+            )?;
         }
     }
     Ok(())
+}
+
+/// Sums the regular-file bytes under `dir` (links skipped, like the copy).
+///
+/// Used only to size the destination-volume demand up front; the per-file loop
+/// re-checks against the real free space.
+fn tree_bytes(dir: &Path, limit: u64) -> Result<u64> {
+    let mut total: u64 = 0;
+    let reader = std::fs::read_dir(dir).map_err(|e| io_err(dir, e))?;
+    for item in reader {
+        let item = item.map_err(|e| io_err(dir, e))?;
+        let child = item.path();
+        let meta = std::fs::symlink_metadata(&child).map_err(|e| io_err(&child, e))?;
+        if meta.file_type().is_symlink() || util::is_reparse_point(util::file_attributes(&meta)) {
+            continue;
+        }
+        let size = if meta.is_dir() {
+            tree_bytes(&child, limit)?
+        } else {
+            meta.len()
+        };
+        total = total.saturating_add(size);
+        if total > limit {
+            return Err(RtError::PayloadTooLarge(format!(
+                "copy would move more than {limit} bytes in one request"
+            )));
+        }
+    }
+    Ok(total)
 }
 
 // ---------------------------------------------------------------------------
@@ -828,7 +1155,8 @@ fn copy_dir_tree(
 /// Reads a byte range and returns it base64-encoded plus decoded text.
 ///
 /// `length == None` means "as much as the limit allows"; the result is always
-/// capped by `limits.max_read_bytes`.
+/// capped by `limits.max_read_bytes`. The entry is re-verified through a
+/// handle before reading (see the note on path swapping above).
 pub fn read(
     guard: &PathGuard,
     path: &str,
@@ -852,6 +1180,8 @@ pub fn read(
             guard.display(&real)
         )));
     }
+    // Prove the bytes we are about to return still live inside the jail.
+    verify_entry(guard, &real, &guard.display(&real), true)?;
     let budget = limits.max_read_bytes;
     let wanted = length.unwrap_or(budget).min(budget).min(size - offset);
     let bytes = if wanted == 0 {
@@ -883,6 +1213,8 @@ pub fn read(
     })
 }
 
+/// Writes a whole buffer; the atomic-staging and free-space rules of
+/// [`write_stream`] apply, and the known length tightens the capacity check.
 pub fn write(
     guard: &PathGuard,
     path: &str,
@@ -891,22 +1223,59 @@ pub fn write(
     create_parents: bool,
     limits: &FsLimits,
 ) -> Result<WriteResult> {
-    // A `&[u8]` is already a reader, so validation lives in one place only.
-    write_stream(guard, path, data, overwrite, create_parents, limits)
+    // A `&[u8]` is already a reader, so validation lives in one place only; the
+    // declared length lets the capacity check run before a single byte moves.
+    write_stream_impl(
+        guard,
+        path,
+        data,
+        overwrite,
+        create_parents,
+        limits,
+        Some(data.len() as u64),
+    )
 }
 
 /// Streaming upload: never buffers the whole body, enforces `max_upload_bytes`.
 ///
 /// The body goes to a sibling temp file first (`sync_all`) and is then renamed
 /// into place, so a crash or a mid-transfer failure never leaves a half-written
-/// destination behind.
+/// destination behind. The destination volume must keep [`SPACE_RESERVE_BYTES`]
+/// free (checked up front and then every [`SPACE_RECHECK_BYTES`] of streamed
+/// bytes), and the staged file's handle is re-verified against the jail — see
+/// the note on path swapping above.
 pub fn write_stream<R: Read>(
+    guard: &PathGuard,
+    path: &str,
+    reader: R,
+    overwrite: bool,
+    create_parents: bool,
+    limits: &FsLimits,
+) -> Result<WriteResult> {
+    write_stream_impl(
+        guard,
+        path,
+        reader,
+        overwrite,
+        create_parents,
+        limits,
+        None,
+    )
+}
+
+/// Shared body of [`write`] and [`write_stream`].
+///
+/// `declared` is the body length when the caller knows it (`write` always does,
+/// a chunked upload may not); it only tightens the up-front capacity check,
+/// while the streamed re-check protects the unknown-length case.
+fn write_stream_impl<R: Read>(
     guard: &PathGuard,
     path: &str,
     mut reader: R,
     overwrite: bool,
     create_parents: bool,
     limits: &FsLimits,
+    declared: Option<u64>,
 ) -> Result<WriteResult> {
     let started = Instant::now();
     let real = guard.resolve(path)?;
@@ -938,8 +1307,22 @@ pub fn write_stream<R: Read>(
         }
     }
 
+    // Refuse before spending the volume's headroom, then make sure the target
+    // directory is still the one the guard validated.
+    ensure_capacity(&real, declared, &shown)?;
+    if let Some(parent) = real.parent() {
+        verify_entry(guard, parent, &shown, true)?;
+    }
+
     let tmp = temp_sibling(&real)?;
-    let staged = spill_to_temp(&tmp, &mut reader, limits.max_upload_bytes);
+    let staged = spill_to_temp(
+        guard,
+        &tmp,
+        &real,
+        &shown,
+        &mut reader,
+        limits.max_upload_bytes,
+    );
     let (size, sha256) = match staged {
         Ok(staged) => staged,
         Err(err) => {
@@ -947,7 +1330,7 @@ pub fn write_stream<R: Read>(
             return Err(err);
         }
     };
-    if let Err(err) = publish(&tmp, &io_real, overwritten) {
+    if let Err(err) = publish(guard, &tmp, &io_real, &real, &shown, overwritten) {
         let _ = std::fs::remove_file(&tmp);
         return Err(err);
     }
@@ -974,15 +1357,32 @@ fn temp_sibling(real: &Path) -> Result<PathBuf> {
 }
 
 /// Streams `reader` into a fresh temp file, hashing as it goes.
-fn spill_to_temp<R: Read>(tmp: &Path, reader: &mut R, limit: u64) -> Result<(u64, String)> {
+///
+/// The temp file is created next to the destination (`create_new`, so a planted
+/// link cannot redirect it) and its handle is re-verified against the jail. The
+/// free space is re-checked every [`SPACE_RECHECK_BYTES`], which stops a
+/// chunked upload from eating the volume's headroom; the caller removes the
+/// partial file on any error.
+fn spill_to_temp<R: Read>(
+    guard: &PathGuard,
+    tmp: &Path,
+    real: &Path,
+    shown: &str,
+    reader: &mut R,
+    limit: u64,
+) -> Result<(u64, String)> {
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(tmp)
         .map_err(|e| io_err(tmp, e))?;
+    if let Some(actual) = winio::file_final_path(&file) {
+        verify_final_path(guard, &actual, shown)?;
+    }
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; COPY_CHUNK];
     let mut total: u64 = 0;
+    let mut next_space_check = SPACE_RECHECK_BYTES;
     loop {
         let read = reader.read(&mut buf).map_err(|e| io_err(tmp, e))?;
         if read == 0 {
@@ -997,13 +1397,31 @@ fn spill_to_temp<R: Read>(tmp: &Path, reader: &mut R, limit: u64) -> Result<(u64
         }
         hasher.update(&buf[..read]);
         file.write_all(&buf[..read]).map_err(|e| io_err(tmp, e))?;
+        if total >= next_space_check {
+            ensure_capacity(real, None, shown)?;
+            next_space_check = total.saturating_add(SPACE_RECHECK_BYTES);
+        }
     }
     file.sync_all().map_err(|e| io_err(tmp, e))?;
     Ok((total, crate::crypto::hex_encode(&hasher.finalize())))
 }
 
 /// Moves the staged temp file onto the destination.
-fn publish(tmp: &Path, target: &Path, overwritten: bool) -> Result<()> {
+///
+/// The destination directory is verified right before the rename (a swap during
+/// a long upload is the remaining window) and the published file afterwards, so
+/// an escaped write is reported instead of silently succeeding.
+fn publish(
+    guard: &PathGuard,
+    tmp: &Path,
+    target: &Path,
+    real: &Path,
+    shown: &str,
+    overwritten: bool,
+) -> Result<()> {
+    if let Some(parent) = real.parent() {
+        verify_entry(guard, parent, shown, true)?;
+    }
     if overwritten {
         // `MoveFileEx` cannot replace a read-only file.
         if let Ok(meta) = std::fs::symlink_metadata(target) {
@@ -1012,7 +1430,11 @@ fn publish(tmp: &Path, target: &Path, overwritten: bool) -> Result<()> {
             }
         }
     }
-    std::fs::rename(tmp, target).map_err(|e| io_err(target, e))
+    std::fs::rename(tmp, target).map_err(|e| io_err(target, e))?;
+    if let Some(actual) = winio::real_path(real, true) {
+        verify_final_path(guard, &actual, shown)?;
+    }
+    Ok(())
 }
 
 /// Drive letters (full access) or the workspace root (jailed) plus quick paths.
@@ -1069,20 +1491,32 @@ fn quick_paths_inside(guard: &PathGuard) -> Vec<QuickPath> {
 }
 
 /// Opens a file for range download: `(resolved path, file handle, size)`.
+///
+/// The handle's final path is re-checked against the jail (see the note on
+/// path swapping above), so a link swapped in after `resolve` cannot turn a
+/// download into an out-of-jail read.
 pub fn open_for_read(guard: &PathGuard, path: &str) -> Result<(PathBuf, std::fs::File, u64)> {
     let real = guard.resolve(path)?;
     let io_real = io_path(&real);
+    let shown = guard.display(&real);
     // Follow the link on purpose: the guard already canonicalised the leaf, but
     // a full-scope path may still end in a link to a regular file.
     let meta = std::fs::metadata(&io_real).map_err(|e| io_err(&real, e))?;
     if meta.is_dir() {
-        return Err(RtError::BadRequest(format!(
-            "`{}` is a directory",
-            guard.display(&real)
-        )));
+        return Err(RtError::BadRequest(format!("`{shown}` is a directory")));
     }
     let file = std::fs::File::open(&io_real).map_err(|e| io_err(&real, e))?;
-    Ok((real, file, meta.len()))
+    let verified = match winio::file_final_path(&file) {
+        Some(actual) => {
+            verify_final_path(guard, &actual, &shown)?;
+            actual
+        }
+        None => {
+            revalidate(guard, &real, &shown)?;
+            real
+        }
+    };
+    Ok((verified, file, meta.len()))
 }
 
 /// Resolves a client path to a real path (re-exported convenience).
@@ -1896,5 +2330,141 @@ mod tests {
         assert!(real.is_absolute());
         assert!(guard.is_inside(&real));
         assert_eq!(guard.display(&real), "\\a.txt");
+    }
+
+    // -- destination capacity (S-16) -----------------------------------------
+
+    #[test]
+    fn capacity_check_rejects_a_payload_the_volume_cannot_hold() {
+        let (dir, _guard) = workspace();
+        let target = dir.path().join("payload.bin");
+        let free = free_bytes(&target).expect("a local volume reports its free space");
+        // Exactly the free space is not enough: the reserve has to survive.
+        let err = ensure_capacity(&target, Some(free), "\\payload.bin")
+            .expect_err("a payload equal to the free space leaves no reserve");
+        assert_eq!(code(&err), ErrorCode::PayloadTooLarge);
+        let message = err.to_string();
+        assert!(
+            message.contains(&free.to_string()),
+            "the message states the free space: {message}"
+        );
+        assert!(
+            message.contains(&(free + SPACE_RESERVE_BYTES).to_string()),
+            "the message states the demand including the reserve: {message}"
+        );
+        // A payload that clearly fits still passes.
+        ensure_capacity(&target, Some(1024), "\\payload.bin").expect("a small payload fits");
+        // An unknown length only has to leave the reserve untouched.
+        ensure_capacity(&target, None, "\\payload.bin").expect("streamed writes pass up front");
+    }
+
+    #[test]
+    fn write_and_copy_still_pass_the_capacity_guard() {
+        let (dir, guard) = workspace();
+        let written = write(&guard, "\\a.bin", &vec![7u8; 4096], false, true, &limits())
+            .expect("a small write fits");
+        assert_eq!(written.size, 4096);
+        let copied = copy(
+            &guard,
+            &CopyRequest {
+                from: "\\a.bin".into(),
+                to: "\\b.bin".into(),
+                overwrite: false,
+                recursive: false,
+            },
+        )
+        .expect("a small copy fits");
+        assert_eq!(copied.size, 4096);
+        assert_eq!(
+            fs::metadata(dir.path().join("b.bin")).expect("b.bin").len(),
+            4096
+        );
+    }
+
+    // -- kernel-handle re-validation (S-31) ----------------------------------
+
+    #[test]
+    fn final_path_check_rejects_paths_outside_the_jail() {
+        let (_dir, guard) = workspace();
+        let outside = tempfile::tempdir().expect("outside dir");
+        let secret = outside.path().join("secret.txt");
+        fs::write(&secret, b"secret").expect("secret fixture");
+        assert_code(
+            verify_final_path(&guard, &secret, "\\escape"),
+            ErrorCode::PolicyDenied,
+        );
+        // Full scope has no jail, so the same path is fine there.
+        let full = PathGuard::new(Scope::Full, None).expect("full guard");
+        verify_final_path(&full, &secret, "C:\\Windows\\win.ini").expect("full scope allows it");
+    }
+
+    #[test]
+    fn a_junction_inside_the_jail_cannot_smuggle_io_outside() {
+        let (dir, guard) = workspace();
+        let outside = tempfile::tempdir().expect("outside dir");
+        fs::write(outside.path().join("secret.txt"), b"secret").expect("secret fixture");
+        fs::create_dir(dir.path().join("sub")).expect("sub dir");
+        let link = dir.path().join("sub").join("escape");
+        // Junctions are created by unprivileged users; if this environment
+        // refuses, the direct check in the previous test still covers the logic.
+        let created = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(outside.path())
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        if !created {
+            return;
+        }
+        // The link itself lives inside the jail, so unlinking it is allowed...
+        verify_entry(&guard, &link, "\\sub\\escape", false).expect("the link itself is inside");
+        // ...but following it ends up outside and must be refused.
+        assert_code(
+            verify_entry(&guard, &link, "\\sub\\escape", true),
+            ErrorCode::PolicyDenied,
+        );
+        // Resolving through the link is refused even earlier.
+        assert_code(
+            read(&guard, "\\sub\\escape\\secret.txt", 0, None, &limits()),
+            ErrorCode::ScopeViolation,
+        );
+        // Addressing the link directly is refused at resolve time, so the
+        // outside target is never touched.
+        let refused = delete(
+            &guard,
+            &DeleteRequest {
+                paths: vec!["\\sub\\escape".into()],
+                recursive: false,
+                even_if_readonly: false,
+            },
+        )
+        .expect("delete reports per-path failures");
+        assert_eq!(refused.failed.len(), 1, "delete: {refused:?}");
+        assert_eq!(refused.failed[0].code, ErrorCode::ScopeViolation);
+        assert!(
+            outside.path().join("secret.txt").exists(),
+            "the link target survives"
+        );
+        // Deleting the containing directory unlinks the junction without ever
+        // descending into it.
+        let batch = delete(
+            &guard,
+            &DeleteRequest {
+                paths: vec!["\\sub".into()],
+                recursive: true,
+                even_if_readonly: false,
+            },
+        )
+        .expect("delete reports per-path failures");
+        assert!(batch.failed.is_empty(), "delete failed: {:?}", batch.failed);
+        assert!(
+            outside.path().join("secret.txt").exists(),
+            "the link target survives a recursive delete"
+        );
+        assert!(
+            fs::symlink_metadata(&dir.path().join("sub")).is_err(),
+            "the containing directory is gone"
+        );
     }
 }
