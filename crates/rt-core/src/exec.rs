@@ -23,7 +23,8 @@
 //! * On Windows the child is placed in a kill-on-close **job object**, so the
 //!   whole process tree dies with the run even when a grandchild detaches from
 //!   the direct child; `taskkill /T /F` remains as the fallback when the OS
-//!   refuses the job.
+//!   refuses the job, and it is always invoked through its absolute system
+//!   path so a poisoned `PATH` cannot intercept the teardown.
 //! * Standard input is decoded in bounded slices and written from a dedicated
 //!   thread, so a child that never reads can be killed by the deadline instead
 //!   of parking the collector inside a blocking write.
@@ -888,16 +889,36 @@ fn kill_tree(child: &mut std::process::Child, pid: u32) {
 /// Kills a process tree using nothing but its PID.
 ///
 /// Reader threads have no `Child` handle, so the tree is taken down through
-/// `taskkill`; the collector's own [`kill_tree`] path stays unchanged.
+/// the system `taskkill`; the collector's own [`kill_tree`] path stays unchanged.
 #[cfg(windows)]
 fn kill_tree_by_pid(pid: u32) {
-    let mut cmd = Command::new("taskkill");
+    let mut cmd = Command::new(taskkill_path());
     cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     silence_console(&mut cmd);
     let _ = cmd.status();
+}
+
+/// Resolves the system `taskkill.exe` without going through `PATH`.
+///
+/// A bare `taskkill` is looked up in `PATH`, where a writable directory (or a
+/// planted `taskkill.exe`) can intercept the teardown of the process tree. The
+/// system copy is therefore addressed through `%SystemRoot%`, defaulting to
+/// `C:\Windows`; only when that file is missing does the bare name remain as a
+/// last resort.
+#[cfg(windows)]
+fn taskkill_path() -> PathBuf {
+    let root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let candidate = root.join("System32").join("taskkill.exe");
+    if candidate.is_file() {
+        candidate
+    } else {
+        PathBuf::from("taskkill")
+    }
 }
 
 /// Killing by PID is Windows-only; elsewhere the collector kills the child
@@ -1997,6 +2018,37 @@ mod tests {
         assert!(
             !survived,
             "the grandchild survived the run and completed its work"
+        );
+    }
+
+    /// The teardown must not resolve `taskkill` through `PATH`: a writable
+    /// directory early in `PATH` could otherwise intercept the kill of the
+    /// process tree (S-42).
+    #[cfg(windows)]
+    #[test]
+    fn taskkill_is_invoked_through_its_absolute_system_path() {
+        let path = taskkill_path();
+        let text = path.to_string_lossy().to_lowercase();
+
+        assert!(
+            path.is_absolute(),
+            "taskkill must be addressed absolutely, got {path:?}"
+        );
+        assert!(
+            text.ends_with(r"\system32\taskkill.exe"),
+            "taskkill must come from the system directory, got {path:?}"
+        );
+        assert!(
+            path.is_file(),
+            "the resolved taskkill must exist on disk: {path:?}"
+        );
+
+        let root = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        assert!(
+            path.starts_with(&root),
+            "expected the system copy under {root:?}, got {path:?}"
         );
     }
 }
