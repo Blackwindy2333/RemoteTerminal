@@ -20,9 +20,56 @@ use crate::error::{Result, RtError};
 
 /// Reserved DOS device names (case-insensitive, also with an extension).
 const RESERVED: &[&str] = &[
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    "CON", "PRN", "AUX", "NUL", "CLOCK$", "CONIN$", "CONOUT$", "COM1", "COM2", "COM3", "COM4",
+    "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
+    "LPT7", "LPT8", "LPT9",
 ];
+
+/// Characters Windows drops or that let a name lie about what it is.
+///
+/// * `U+200B..U+200D`, `U+FEFF` — zero-width characters: the name looks like
+///   `hello.txt` but is a different file.
+/// * `U+200E`, `U+200F`, `U+061C`, `U+202A..U+202E`, `U+2066..U+2069` — bidi
+///   controls: a right-to-left override makes `txt.exe` render as `exe.txt`,
+///   and a device name can be hidden behind an override.
+///
+/// `c.is_control()` already covers C0/C1; these are Unicode `Cf` characters,
+/// which is why they need their own check.
+fn is_hidden_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{061C}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Windows strips trailing spaces and looks at the stem before the first dot,
+/// so `CON .txt`, `CON.txt` and `CON` all name the console device. Superscript
+/// digits are accepted by the OS for `COM¹`..`COM⁹`, which is why they are
+/// folded to ASCII before the lookup.
+fn device_stem(name: &str) -> String {
+    let stem = name.split('.').next().unwrap_or(name);
+    let stem = stem.trim_end_matches(' ');
+    stem.chars()
+        .map(|c| match c {
+            '⁰' => '0',
+            '¹' => '1',
+            '²' => '2',
+            '³' => '3',
+            '⁴' => '4',
+            '⁵' => '5',
+            '⁶' => '6',
+            '⁷' => '7',
+            '⁸' => '8',
+            '⁹' => '9',
+            other => other,
+        })
+        .collect::<String>()
+        .to_ascii_uppercase()
+}
 
 #[derive(Debug, Clone)]
 pub struct PathGuard {
@@ -188,6 +235,13 @@ fn validate_syntax(input: &str) -> Result<PathBuf> {
             "path must not contain control characters".into(),
         ));
     }
+    // Zero-width and bidi-control characters let a name misrepresent itself
+    // (see `is_hidden_format_char`); no legitimate path needs them.
+    if trimmed.chars().any(is_hidden_format_char) {
+        return Err(RtError::InvalidPath(
+            "path must not contain zero-width or bidirectional control characters".into(),
+        ));
+    }
     let lower = trimmed.to_ascii_lowercase();
 
     // Device namespaces and raw paths: `\\.\PhysicalDrive0`, `\\?\GLOBALROOT\...`
@@ -221,12 +275,21 @@ fn validate_syntax(input: &str) -> Result<PathBuf> {
 
     let path = PathBuf::from(trimmed);
 
-    // `C:foo` (drive-relative) has surprising semantics — reject it.
+    // `C:foo` (drive-relative) has surprising semantics — reject it. `C:` on
+    // its own is the *residual* drive path: it means "the current directory of
+    // drive C", not the root, so it is rejected too (use `C:\`).
     let s = trimmed.replace('/', "\\");
     let bytes = s.as_bytes();
     if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
         let rest = &s[2..];
-        if !rest.is_empty() && !rest.starts_with('\\') {
+        if rest.is_empty() {
+            return Err(RtError::InvalidPath(format!(
+                "`{}` is a drive-relative path (the drive's current directory); use `{}`",
+                &s[..2],
+                format_args!("{}\\", &s[..2])
+            )));
+        }
+        if !rest.starts_with('\\') {
             return Err(RtError::InvalidPath(
                 "drive-relative paths (`C:name`) are not allowed; use `C:\\name`".into(),
             ));
@@ -278,7 +341,7 @@ fn validate_syntax(input: &str) -> Result<PathBuf> {
                         "`{name}` ends with a space or dot, which Windows silently trims"
                     )));
                 }
-                let stem = name.split('.').next().unwrap_or(&name).to_ascii_uppercase();
+                let stem = device_stem(&name);
                 if RESERVED.contains(&stem.as_str()) {
                     return Err(RtError::InvalidPath(format!(
                         "`{name}` is a reserved device name"
@@ -558,6 +621,65 @@ mod tests {
         }
         assert!(guard.resolve("C:\\Windows").is_ok());
         assert!(guard.resolve("C:/Windows/System32").is_ok());
+    }
+
+    /// S-28: the DOS device names Windows honours through several disguises.
+    #[test]
+    fn rejects_device_name_variants() {
+        let guard = PathGuard::new(Scope::Full, None).expect("guard");
+        for bad in [
+            "CON",
+            "con.txt",
+            "CON .txt",   // stem with a trailing space still names the console
+            "CON.",       // gone through the trailing-dot rule
+            "NUL.log",
+            "clock$",
+            "CONIN$",
+            "CONOUT$",
+            "COM1",
+            "LPT9.txt",
+            "COM\u{00B9}", // COM¹ — superscript digits are DOS device numbers
+            "sub\\AUX",
+        ] {
+            // `CON.` is rejected for ending in a dot; either way it must fail.
+            assert!(guard.resolve(bad).is_err(), "should reject {bad:?}");
+        }
+        // Names that merely start with a device name are fine.
+        for good in ["CONSOLE.txt", "COM10.txt", "nulled.txt", "clock.txt"] {
+            assert!(guard.resolve(good).is_ok(), "should accept {good:?}");
+        }
+    }
+
+    /// S-29: zero-width and bidi-control characters hide what a name really is.
+    #[test]
+    fn rejects_zero_width_and_bidi_characters() {
+        let guard = PathGuard::new(Scope::Full, None).expect("guard");
+        for bad in [
+            "invoice\u{202E}txt.exe", // right-to-left override
+            "a\u{200B}b.txt",         // zero-width space
+            "a\u{2066}b\u{2069}.txt", // bidi isolates
+            "a\u{200E}b.txt",         // left-to-right mark
+            "a\u{FEFF}b.txt",         // zero-width no-break space
+            "a\u{061C}b.txt",         // arabic letter mark
+        ] {
+            assert!(guard.resolve(bad).is_err(), "should reject {bad:?}");
+        }
+        // Ordinary non-ASCII names stay usable.
+        for good in ["报告.docx", "café.txt", "日本語のファイル.txt"] {
+            assert!(guard.resolve(good).is_ok(), "should accept {good:?}");
+        }
+    }
+
+    /// S-30: `C:` alone means "drive C's current directory", not its root.
+    #[test]
+    fn rejects_residual_drive_paths() {
+        let guard = PathGuard::new(Scope::Full, None).expect("guard");
+        for bad in ["C:", "c:", "D:"] {
+            assert!(guard.resolve(bad).is_err(), "should reject {bad:?}");
+        }
+        assert!(guard.resolve("C:\\").is_ok());
+        assert!(guard.resolve("C:/").is_ok());
+        assert!(guard.resolve("C:\\Windows").is_ok());
     }
 
     #[test]
