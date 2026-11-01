@@ -1247,6 +1247,15 @@ impl App {
             self.toasts.error("配置未通过校验，无法启动服务端；请先修复设置页中的错误");
             return;
         }
+        // Persist before serving. The UI can start a server from settings that
+        // were never written to disk; a later `remote-terminal serve` would
+        // then read an empty config and reject every login.
+        let config_path = self.paths.config_file.clone();
+        if let Err(err) = self.config.save_with_header(&config_path) {
+            self.toasts
+                .error(format!("无法保存配置，服务端未启动：{err}"));
+            return;
+        }
         let options = rt_server::ServerOptions {
             config: self.config.clone(),
             paths: self.paths.clone(),

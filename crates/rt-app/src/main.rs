@@ -350,6 +350,20 @@ async fn serve(boot: rt_app::Bootstrapped) -> anyhow::Result<i32> {
         tracing::warn!(target: "config", "{warning}");
     }
 
+    // Nobody could ever authenticate against a listener with no credentials:
+    // every login would be rejected with the same generic 401, which looks
+    // exactly like a wrong password. Refuse instead of binding a dead server.
+    let config = boot.config();
+    if config.enabled_users().is_empty() && config.server.api_keys.is_empty() {
+        bail!(
+            "refusing to start the server: {} has no users and no API keys, so every login would be rejected.\n\
+             Add a user first:\n  \
+             remote-terminal hash-password      (prints a `[[server.users]]` block for the file)\n\
+             or start the server from the desktop UI and save the settings there.",
+            boot.loaded.path.display()
+        );
+    }
+
     let state = rt_server::AppState::new(rt_server::ServerOptions {
         config: boot.config().clone(),
         paths: boot.paths.clone(),
