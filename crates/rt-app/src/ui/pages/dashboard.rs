@@ -8,7 +8,7 @@ use rt_client::{RemoteClient, Target};
 use rt_core::config::Config;
 use rt_protocol::{QuickStatus, ServerInfo, SysInfoSnapshot};
 
-use crate::ui::app::{describe_error, App, ConnectRequest, Conn, Page};
+use crate::ui::app::{describe_error, App, ConnectRequest, Page};
 use crate::ui::theme::{palette, Palette, Radius, Space, Tone, Type};
 use crate::ui::widgets::{self, Btn};
 
@@ -109,6 +109,52 @@ impl State {
                 self.pin = fingerprint.clone();
             }
         }
+    }
+
+    /// Fills the connect form from one configured host entry.
+    pub fn seed_from_host(&mut self, host: &rt_core::config::HostConfig) {
+        self.host = host.host.clone();
+        self.port = host.port.to_string();
+        if !host.username.is_empty() {
+            self.username = host.username.clone();
+        }
+        self.pin = host.fingerprint.clone().unwrap_or_default();
+        self.tls = true;
+    }
+
+    /// Validates the form and produces a connect request.
+    pub fn build_request(&self, config: &Config) -> Result<ConnectRequest, String> {
+        let port: u16 = match self.port.trim().parse() {
+            Ok(port) if port > 0 => port,
+            _ => return Err("端口必须是 1-65535 之间的整数".to_string()),
+        };
+        let host = self.host.trim().to_string();
+        if host.is_empty() {
+            return Err("请输入主机名或 IP".to_string());
+        }
+        let api_key = self.api_key.trim().to_string();
+        if self.use_api_key && api_key.is_empty() {
+            return Err("请输入 API 密钥".to_string());
+        }
+        let password = self.password.clone();
+        if !self.use_api_key && password.is_empty() {
+            return Err("请输入密码".to_string());
+        }
+        let username = self.username.trim().to_string();
+        if !self.use_api_key && username.is_empty() {
+            return Err("请输入用户名".to_string());
+        }
+        Ok(ConnectRequest {
+            host,
+            port,
+            tls: self.tls,
+            username,
+            password,
+            api_key: self.use_api_key.then_some(api_key),
+            pin: normalize_fingerprint(&self.pin),
+            accept_new: false,
+            timeout_secs: config.client.request_timeout_secs,
+        })
     }
 
     /// Called by the shell once a connection becomes usable.
@@ -270,7 +316,7 @@ fn connect_form(app: &mut App, ui: &mut Ui) {
         "输入目标机器的地址与凭据；凭据只在内存中使用，不会写入配置文件",
     );
 
-    let busy = matches!(app.conn, Conn::Connecting { .. });
+    let busy = app.active_slot().map(|slot| slot.busy()).unwrap_or(false);
     let mut probe = false;
     let mut submit = false;
 
@@ -447,47 +493,14 @@ fn connect_form(app: &mut App, ui: &mut Ui) {
 
 /// Validates the form and starts a connect attempt.
 fn submit_connect(app: &mut App) {
-    let port = match app.dashboard.port.trim().parse::<u16>() {
-        Ok(port) if port > 0 => port,
-        _ => {
-            app.dashboard.form_error = Some("端口必须是 1-65535 之间的整数".to_string());
-            return;
+    let result = app.with_dashboard(|state, app| state.build_request(&app.config));
+    match result {
+        Ok(request) => {
+            app.dashboard.form_error = None;
+            app.connect(request);
         }
-    };
-    let host = app.dashboard.host.trim().to_string();
-    if host.is_empty() {
-        app.dashboard.form_error = Some("请输入主机名或 IP".to_string());
-        return;
+        Err(err) => app.dashboard.form_error = Some(err),
     }
-    let use_api_key = app.dashboard.use_api_key;
-    let api_key = app.dashboard.api_key.trim().to_string();
-    let password = app.dashboard.password.clone();
-    if use_api_key && api_key.is_empty() {
-        app.dashboard.form_error = Some("请输入 API 密钥".to_string());
-        return;
-    }
-    if !use_api_key && password.is_empty() {
-        app.dashboard.form_error = Some("请输入密码".to_string());
-        return;
-    }
-    let username = app.dashboard.username.trim().to_string();
-    if !use_api_key && username.is_empty() {
-        app.dashboard.form_error = Some("请输入用户名".to_string());
-        return;
-    }
-    let pin = normalize_fingerprint(&app.dashboard.pin);
-    app.dashboard.form_error = None;
-    app.connect(ConnectRequest {
-        host,
-        port,
-        tls: app.dashboard.tls,
-        username,
-        password,
-        api_key: use_api_key.then_some(api_key),
-        pin,
-        accept_new: false,
-        timeout_secs: app.config.client.request_timeout_secs,
-    });
 }
 
 /// Strips separators from a hex fingerprint so user input is tolerant.
