@@ -578,8 +578,8 @@ async fn client_download(
     println!("  remote:      {}", report.remote_path);
     println!("  size:        {}", rt_core::util::format_bytes(report.total_size));
     println!(
-        "  resumed at:  {} bytes ({})",
-        report.resumed_from,
+        "  resumed at:  {} ({})",
+        rt_core::util::format_bytes(report.resumed_from),
         if report.resumed_from == 0 {
             "started from zero"
         } else {
@@ -587,7 +587,7 @@ async fn client_download(
         }
     );
     println!(
-        "  transferred: {} bytes",
+        "  transferred: {}",
         rt_core::util::format_bytes(report.bytes_written)
     );
     if report.restarted {
