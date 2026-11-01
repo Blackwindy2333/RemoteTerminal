@@ -154,12 +154,21 @@ pub fn acquire_single_instance(paths: &ResolvedPaths, enabled: bool) -> anyhow::
 pub fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
-        .max_blocking_threads(32)
+        // S-23: blocking work (file I/O, process spawns, screen capture) runs on
+        // this pool. It is deliberately larger than the synchronous core count
+        // so a handful of slow captures cannot starve requests, and the server
+        // additionally applies its own admission limit (64 permits) before
+        // handing work to `spawn_blocking`, so the pool itself is the backstop
+        // rather than the primary throttle.
+        .max_blocking_threads(BLOCKING_THREADS)
         .thread_name("rt-worker")
         .enable_all()
         .build()
         .context("cannot start the async runtime")
 }
+
+/// Upper bound on threads doing blocking work; see [`runtime`].
+pub const BLOCKING_THREADS: usize = 64;
 
 /// Absolute path helper used by the CLI defaults.
 pub fn current_dir() -> PathBuf {
