@@ -20,6 +20,13 @@
 //!   the run, kills the process tree and is reported as a cancellation, so a
 //!   disconnected operator cannot leave the exporter collecting data nobody
 //!   reads.
+//! * On Windows the child is placed in a kill-on-close **job object**, so the
+//!   whole process tree dies with the run even when a grandchild detaches from
+//!   the direct child; `taskkill /T /F` remains as the fallback when the OS
+//!   refuses the job.
+//! * Standard input is decoded in bounded slices and written from a dedicated
+//!   thread, so a child that never reads can be killed by the deadline instead
+//!   of parking the collector inside a blocking write.
 //! * `effective_cwd` is always an absolute, canonical path that was resolved
 //!   through the [`PathGuard`] jail, so a caller may safely log it.
 //! * A *cancelled* run is reported as `timed_out = false` and `exit_code = -1`;
@@ -68,6 +75,14 @@ const STREAM_CHANNEL_CAPACITY: usize = 256;
 const STREAM_SEND_TIMEOUT: Duration = Duration::from_millis(1000);
 /// Poll interval used while waiting for room in the bounded channel.
 const STREAM_SEND_POLL: Duration = Duration::from_millis(5);
+/// Largest decoded stdin slice handed to the child in one write.
+///
+/// The payload is decoded and written in pieces of this size, so a large
+/// `stdin_b64` never materialises a second full copy in memory (S-12).
+const STDIN_CHUNK_BYTES: usize = 64 * 1024;
+/// Number of base64 characters whose decoding stays within
+/// [`STDIN_CHUNK_BYTES`]. A multiple of four, so every slice decodes alone.
+const STDIN_CHUNK_QUAD: usize = 4 * (STDIN_CHUNK_BYTES / 3);
 
 /// `CREATE_NO_WINDOW` — spawned helpers must not flash a console window.
 #[cfg(windows)]
@@ -357,12 +372,13 @@ pub fn prepare(guard: &PathGuard, req: &ExecRequest, limits: &ExecLimits) -> Res
 
     let mut prepared = req.clone();
 
-    if prepared.stdin_b64.is_some() {
-        let bytes = decode_base64(prepared.stdin_b64.as_deref().unwrap_or_default())?;
-        if bytes.len() as u64 > limits.max_output_bytes as u64 {
+    if let Some(payload) = prepared.stdin_b64.as_deref() {
+        // Decoded in slices: the check must not build a full copy of a hostile
+        // payload before the command even starts.
+        let decoded_len = for_each_base64_chunk(payload, |_slice| Ok(()))?;
+        if decoded_len > limits.max_output_bytes as u64 {
             return Err(RtError::bad_request(format!(
-                "stdin payload of {} bytes exceeds the {} byte limit",
-                bytes.len(),
+                "stdin payload of {decoded_len} bytes exceeds the {} byte limit",
                 limits.max_output_bytes
             )));
         }
@@ -651,12 +667,81 @@ fn append_command(command: &mut Command, raw: &str) {
     }
 }
 
-fn decode_base64(value: &str) -> Result<Vec<u8>> {
+/// Decodes a base64 payload in bounded slices, handing each one to `sink`.
+///
+/// Returns the number of decoded bytes. Whitespace between characters is
+/// ignored, which is what clients produce when they wrap a payload. At most one
+/// slice ([`STDIN_CHUNK_BYTES`]) is held at a time, so a hostile `stdin_b64`
+/// costs memory only in the request string itself, never in a second copy.
+///
+/// Slices are cut on multiples of four characters, so each one decodes on its
+/// own; padding therefore stays in the final slice, where the decoder expects it.
+fn for_each_base64_chunk<F>(payload: &str, mut sink: F) -> Result<u64>
+where
+    F: FnMut(&[u8]) -> Result<()>,
+{
     use base64::Engine as _;
-    let compact: String = value.chars().filter(|c| !c.is_whitespace()).collect();
-    base64::engine::general_purpose::STANDARD
-        .decode(compact.as_bytes())
-        .map_err(|e| RtError::bad_request(format!("stdin payload is not valid base64: {e}")))
+
+    let mut quad: Vec<u8> = Vec::with_capacity(STDIN_CHUNK_QUAD + 4);
+    let mut total: u64 = 0;
+
+    let decode = |slice: &[u8]| -> Result<Vec<u8>> {
+        base64::engine::general_purpose::STANDARD
+            .decode(slice)
+            .map_err(|e| RtError::bad_request(format!("stdin payload is not valid base64: {e}")))
+    };
+
+    for ch in payload.chars() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        // The base64 alphabet is ASCII; a non-ASCII character is invalid input
+        // and is pushed through as its UTF-8 bytes so the decoder reports it.
+        let mut buf = [0u8; 4];
+        quad.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        if quad.len() >= STDIN_CHUNK_QUAD {
+            let cut = quad.len() & !3;
+            let decoded = decode(&quad[..cut])?;
+            total += decoded.len() as u64;
+            sink(&decoded)?;
+            quad.drain(..cut);
+        }
+    }
+
+    if !quad.is_empty() {
+        let decoded = decode(&quad)?;
+        total += decoded.len() as u64;
+        sink(&decoded)?;
+    }
+
+    Ok(total)
+}
+
+/// Feeds the child's standard input from its own thread.
+///
+/// Writing on the collector thread would park the run: a child that never reads
+/// leaves the pipe full and the write blocks outside the timeout window, so the
+/// deadline could never fire (S-12). With a writer thread the collector keeps
+/// polling, and killing the tree closes the pipe, which fails the pending write
+/// and lets the thread exit. The returned receiver fires once the writer is
+/// finished (or failed), so the collector only waits a bounded grace for it.
+fn spawn_stdin_writer(
+    mut pipe: std::process::ChildStdin,
+    payload: String,
+) -> std::sync::mpsc::Receiver<()> {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // `prepare` validated the payload, so decode errors are not expected
+        // here; a failed write only means the child stopped reading, which its
+        // exit status already explains.
+        let _ = for_each_base64_chunk(&payload, |chunk| {
+            pipe.write_all(chunk)
+                .map_err(|e| RtError::io(PathBuf::from("<stdin>"), e))
+        });
+        let _ = pipe.flush();
+        let _ = done_tx.send(());
+    });
+    done_rx
 }
 
 /// Spawns the reader thread for one child pipe.
@@ -822,6 +907,158 @@ fn kill_tree_by_pid(pid: u32) {
     let _ = pid;
 }
 
+/// Win32 job object bindings, declared by hand: the layer intentionally has no
+/// `windows-sys` dependency.
+#[cfg(windows)]
+mod win32_job {
+    use std::ffi::c_void;
+
+    /// `JOBOBJECT_BASIC_LIMIT_INFORMATION`.
+    ///
+    /// The layout is fixed by Win32: two `LARGE_INTEGER` (8 bytes each), a
+    /// `DWORD`, then 8-byte-aligned `SIZE_T`s. `repr(C)` inserts exactly the
+    /// same padding Windows does, so `size_of` is 64 bytes on x64.
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct JobBasicLimitInformation {
+        pub per_process_user_time_limit: i64,
+        pub per_job_user_time_limit: i64,
+        pub limit_flags: u32,
+        pub minimum_working_set_size: usize,
+        pub maximum_working_set_size: usize,
+        pub active_process_limit: u32,
+        pub affinity: usize,
+        pub priority_class: u32,
+        pub scheduling_class: u32,
+    }
+
+    /// `IO_COUNTERS`: six 64-bit counters, no padding.
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct IoCounters {
+        pub read_operation_count: u64,
+        pub write_operation_count: u64,
+        pub other_operation_count: u64,
+        pub read_transfer_count: u64,
+        pub write_transfer_count: u64,
+        pub other_transfer_count: u64,
+    }
+
+    /// `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` (144 bytes on x64).
+    #[repr(C)]
+    #[derive(Default)]
+    pub struct JobExtendedLimitInformation {
+        pub basic_limit_information: JobBasicLimitInformation,
+        pub io_info: IoCounters,
+        pub process_memory_limit: usize,
+        pub job_memory_limit: usize,
+        pub peak_process_memory_used: usize,
+        pub peak_job_memory_used: usize,
+    }
+
+    /// The abi layout is checked instead of trusted: a mismatch here would make
+    /// `SetInformationJobObject` read garbage.
+    #[cfg(target_pointer_width = "64")]
+    const _: () = assert!(std::mem::size_of::<JobBasicLimitInformation>() == 64);
+    #[cfg(target_pointer_width = "64")]
+    const _: () = assert!(std::mem::size_of::<JobExtendedLimitInformation>() == 144);
+
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+    pub const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+    /// `JobObjectExtendedLimitInformation`.
+    pub const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
+
+    // Handles are declared as `isize`, the convention the rest of the crate uses
+    // for kernel32 handles (`capture.rs`), so the two declarations agree.
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub fn CreateJobObjectW(attributes: *const c_void, name: *const u16) -> isize;
+        pub fn SetInformationJobObject(
+            job: isize,
+            class: i32,
+            info: *const c_void,
+            info_len: u32,
+        ) -> i32;
+        pub fn AssignProcessToJobObject(job: isize, process: isize) -> i32;
+        pub fn CloseHandle(object: isize) -> i32;
+    }
+}
+
+/// Owns a kill-on-close job object holding the child's process tree.
+///
+/// `taskkill /T /F` walks the parent chain, so it misses a grandchild whose
+/// direct parent already exited (and any process that detached itself). Job
+/// membership is inherited by every descendant, and closing the last handle
+/// terminates the whole job — which is exactly what the `Drop` below does when
+/// the run finishes normally, times out or is cancelled (S-13).
+#[cfg(windows)]
+struct ProcessJob {
+    handle: isize,
+}
+
+#[cfg(windows)]
+impl ProcessJob {
+    /// Creates the job and joins `process` to it.
+    ///
+    /// Returns `None` when the OS refuses — the caller then relies on the
+    /// `taskkill` fallback, so a missing job degrades the teardown but never
+    /// fails the run. The child is assigned immediately after `spawn`, which
+    /// leaves a narrow window in which it could fork a grandchild that escapes
+    /// the job; Windows 8+ allows the nested job this needs, and the kill path
+    /// still sweeps what `taskkill` can see.
+    fn attach(process: isize) -> Option<Self> {
+        let handle = unsafe { win32_job::CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle == 0 {
+            return None;
+        }
+
+        let mut info = win32_job::JobExtendedLimitInformation::default();
+        info.basic_limit_information.limit_flags = win32_job::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            win32_job::SetInformationJobObject(
+                handle,
+                win32_job::JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                std::ptr::addr_of!(info).cast(),
+                std::mem::size_of::<win32_job::JobExtendedLimitInformation>() as u32,
+            )
+        };
+        if configured == 0 {
+            unsafe { win32_job::CloseHandle(handle) };
+            return None;
+        }
+
+        if unsafe { win32_job::AssignProcessToJobObject(handle, process) } == 0 {
+            unsafe { win32_job::CloseHandle(handle) };
+            return None;
+        }
+
+        Some(Self { handle })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessJob {
+    fn drop(&mut self) {
+        if self.handle != 0 {
+            // Last handle: every remaining member is terminated.
+            unsafe { win32_job::CloseHandle(self.handle) };
+            self.handle = 0;
+        }
+    }
+}
+
+/// Puts the child into a kill-on-close job where the platform supports one.
+#[cfg(windows)]
+fn attach_job(child: &std::process::Child) -> Option<ProcessJob> {
+    use std::os::windows::io::AsRawHandle;
+
+    ProcessJob::attach(child.as_raw_handle() as isize)
+}
+
+/// No job objects outside Windows; the child handle is enough there.
+#[cfg(not(windows))]
+fn attach_job(_child: &std::process::Child) {}
+
 /// Shared execution pipeline for `run`, `run_streaming` and `run_summary`.
 fn execute(
     guard: &PathGuard,
@@ -831,13 +1068,12 @@ fn execute(
     sink: &mut dyn FnMut(ExecEvent),
     mode: Mode,
 ) -> Result<(ExecResult, bool)> {
-    let req = prepare(guard, req, limits)?;
+    let mut req = prepare(guard, req, limits)?;
     let plan = shell_plan(&req.shell)?;
 
-    let stdin_bytes = match req.stdin_b64.as_deref() {
-        Some(value) => Some(decode_base64(value)?),
-        None => None,
-    };
+    // The payload stays encoded: `prepare` already validated it and the writer
+    // thread decodes it slice by slice, so no full decoded copy is held here.
+    let stdin_payload = req.stdin_b64.take();
 
     let cwd = req
         .cwd
@@ -859,7 +1095,7 @@ fn execute(
     command
         .args(&plan.args)
         .current_dir(&cwd)
-        .stdin(if stdin_bytes.is_some() {
+        .stdin(if stdin_payload.is_some() {
             Stdio::piped()
         } else {
             Stdio::null()
@@ -878,20 +1114,15 @@ fn execute(
     let pid = child.id();
     let started_at = Instant::now();
 
+    // Join the child to a kill-on-close job before it can do much work, so any
+    // grandchild it spawns inherits the membership and dies with the run.
+    let job = attach_job(&child);
+
     if mode.emits_started() {
         sink(ExecEvent::Started {
             pid: Some(pid),
             shell: req.shell.clone(),
         });
-    }
-
-    // Feed stdin, if any. A child that exits early closes the pipe; that is not
-    // an error of its own — the exit status tells the story.
-    if let Some(bytes) = stdin_bytes {
-        if let Some(mut pipe) = child.stdin.take() {
-            let _ = pipe.write_all(&bytes);
-            let _ = pipe.flush();
-        }
     }
 
     let out_state = Arc::new(StreamState::new());
@@ -940,6 +1171,21 @@ fn execute(
     }
     // Drop our own sender so the receiver disconnects once both readers end.
     drop(tx);
+
+    // Feed stdin from its own thread, now that the readers are draining the
+    // output pipes: writing it inline would park the collector for as long as
+    // the child refuses to read, and could deadlock against a child that fills
+    // its stdout first.
+    let stdin_writer = match stdin_payload {
+        Some(payload) => {
+            let pipe = child
+                .stdin
+                .take()
+                .ok_or_else(|| RtError::internal("stdin pipe disappeared after spawn"))?;
+            Some(spawn_stdin_writer(pipe, payload))
+        }
+        None => None,
+    };
 
     let mut status = None;
     let mut timed_out = false;
@@ -994,6 +1240,17 @@ fn execute(
     // abandonment verdict has to survive the `try_wait` race above.
     if abandoned.load(Ordering::SeqCst) {
         cancelled = true;
+    }
+
+    // Closing the job reaps every descendant — and the pipe handles they
+    // inherited — before the drain below, so a stranded grandchild cannot keep
+    // the readers waiting for the whole grace period.
+    drop(job);
+
+    // The child is gone, so a pending stdin write fails with a broken pipe and
+    // the writer thread returns; the wait stays bounded in case it does not.
+    if let Some(writer_done) = stdin_writer {
+        let _ = writer_done.recv_timeout(READER_GRACE);
     }
 
     // Drain what the readers produced, bounded by `READER_GRACE`. In buffered
@@ -1641,6 +1898,105 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(20),
             "the run must abort early instead of honouring the 30s timeout, took {elapsed:?}"
+        );
+    }
+
+    /// Polls for a file to appear, returning whether it did within `timeout`.
+    fn wait_for_file(path: &Path, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if path.exists() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A child that never reads its stdin must not pin the run: the payload is
+    /// far larger than a pipe buffers, so the write blocks and only the deadline
+    /// can end the command (S-12).
+    #[test]
+    fn large_stdin_cannot_outlive_the_deadline() {
+        // 512 KiB decoded: many pipe buffers, so the write cannot drain before
+        // the child is killed.
+        let payload = vec![b'x'; 512 * 1024];
+        let mut req = ExecRequest::new(ShellKind::Cmd, "ping -n 6 127.0.0.1 >nul");
+        req.timeout_ms = Some(400);
+        req.stdin_b64 = Some({
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(&payload)
+        });
+
+        let started = Instant::now();
+        let result = run(&guard(), &req, &limits()).expect("run");
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.timed_out,
+            "the deadline must fire while the stdin write is blocked"
+        );
+        assert_eq!(result.exit_code, -1);
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "a blocked stdin write must not outlive the deadline, took {elapsed:?}"
+        );
+    }
+
+    /// A grandchild that detaches from the direct child must still die with the
+    /// run: once the parent exits, `taskkill /T` can no longer reach it, so only
+    /// the job object can (S-13).
+    #[test]
+    fn grandchildren_are_reaped_when_the_run_ends() {
+        // `cmd` treats `(`, `)` and `&` as syntax, so the fixture path must be
+        // plain — a `TempRoot` name would carry the thread id in parentheses.
+        let dir = std::env::temp_dir().join(format!("rt_exec_tree_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create grandchild fixture");
+
+        let script = dir.join("grandchild.bat");
+        std::fs::write(
+            &script,
+            "@echo off\r\n\
+             echo started> \"%~dp0started.txt\"\r\n\
+             ping -n 3 127.0.0.1 >nul\r\n\
+             echo finished> \"%~dp0finished.txt\"\r\n",
+        )
+        .expect("write grandchild script");
+
+        // `start /b` puts the grandchild outside the collector's process view;
+        // the parent waits ~1s for it to boot and then exits, which is exactly
+        // the case where the parent chain is gone.
+        let command = format!(
+            "start /b cmd /c \"{}\\grandchild.bat\" & ping -n 2 127.0.0.1 >nul",
+            plain_path(&dir)
+        );
+        let req = ExecRequest::new(ShellKind::Cmd, command);
+
+        let started = Instant::now();
+        let result = run(&guard(), &req, &limits()).expect("run");
+        assert_eq!(result.exit_code, 0, "the parent batch must succeed");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the run must not wait for the detached grandchild"
+        );
+
+        let started_marker = dir.join("started.txt");
+        assert!(
+            wait_for_file(&started_marker, Duration::from_secs(10)),
+            "the grandchild never ran, so the escape case is not exercised"
+        );
+
+        // The grandchild pings for about two seconds; double that is enough to
+        // see it finish if it survived.
+        std::thread::sleep(Duration::from_secs(4));
+        let survived = dir.join("finished.txt").exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !survived,
+            "the grandchild survived the run and completed its work"
         );
     }
 }
