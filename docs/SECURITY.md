@@ -20,6 +20,8 @@ RemoteTerminal 的**密码学底座与路径监狱实现质量很高**：Argon2i
 
 **最该马上修的三件事**：S-01（exec 加作用域校验）、S-04（`serve` 入口强制 `validate()`）、S-05（TLS 握手加超时）。这三条改动量都在 10 行以内，但分别对应"越权"、"明文暴露"、"远程 DoS"三个最坏结果。
 
+> **修复状态（2026-11-01 更新）：本文列出的 S-01…S-42 共 42 条发现已全部修复，并逐条附了提交哈希与验证方式，见 §9「修复状态对照表」。** §2–§4 保留审计当时的原始证据（行号、`✘` 标记都是修复**前**的），它们的作用是回归与复盘：改动相关文件时按这些证据逐条复查，确认没有被改回去。
+
 ---
 
 ## 1. 威胁模型
@@ -348,6 +350,8 @@ RemoteTerminal 的**密码学底座与路径监狱实现质量很高**：Argon2i
 
 ## 7. 与 `docs/ARCHITECTURE.md` 契约的偏离
 
+> 下表是审计当时（修复前）的状态。其中 S-04、S-06、S-08、S-12、S-13、S-22、S-02、S-09 相关的偏离均已在 §9 中修复；`docs/ARCHITECTURE.md` 的相应条目也已同步（§3 安全模型 9–12 条、scope 能力边界、控制文件黑名单、凭据只在已固定证书上发送、`serve` 强制校验）。
+
 | 契约 | 声明 | 实际 | 对应条目 |
 |---|---|---|---|
 | §3.1 传输 | `tls=false` 仅允许"回环 + allow_insecure_lan" | 校验只要求"非回环时必须 allow_insecure_lan"，且 `serve` 不执行校验 | S-04 |
@@ -383,3 +387,88 @@ RemoteTerminal 的**密码学底座与路径监狱实现质量很高**：Argon2i
 10. 审计字段不含秘密；`tracing!` 不含凭据。
 11. 危险默认关闭：`server.enabled=false`、`fs_ops` 的 `overwrite=false`、MCP `recursive=false`、API Key 默认 `workspace`、scope 解析失败回落 `workspace`。
 12. `serve`/GUI 启动都会打印监听地址与证书指纹（`lib.rs:206-218`）。
+
+---
+
+## 9. 修复状态对照表（2026-11-01）
+
+42 条发现全部修复。下表给出每条的级别、修复提交与实现要点；「验证」列给出可以重跑的测试名或命令。
+回归建议：改动 `pathscope.rs` / `fsops.rs` / `exec.rs` / `middleware.rs` / `mcp/tools.rs` 时，对照本表逐条复查，并至少跑一遍 `cargo test --workspace --all-targets`（当前 200+ 用例）。
+
+### 9.1 CRITICAL / HIGH
+
+| ID | 级别 | 提交 | 修复要点 | 验证 |
+|---|---|---|---|---|
+| S-01 | CRITICAL | `7c4df3b` | `POST /exec` 与 WS `Exec` 分支调用 `require_full_scope`，workspace 会话执行命令返回 403 `forbidden` | `cargo test -p rt-app --test e2e`（workspace 用户 exec → 403）；`workspace_sessions_cannot_execute_or_capture` |
+| S-02 | HIGH | `7c4df3b` | `/capture`、`/capture/raw`、`/capture/windows` 与 WS `capture_stream` 全部 Full-only（`/capture/screens` 只含显示器几何，保持开放） | 同上 e2e；`workspace_sessions_cannot_execute_or_capture` |
+| S-03 | HIGH | `7c4df3b` | WS `subscribe_logs` 加 Full 校验，`subscribe_status` 保留（无敏感内容） | `crates/rt-server/tests/api.rs` |
+| S-04 | HIGH | `da1ecc8` + `7c4df3b` | `main.rs::serve` 绑定前 `config.validate()` 失败即 `bail!`；`rt_server::serve` 内部用副本探针再校验一次（避开 port 0 的合法场景） | `remote-terminal serve` 配 `tls=false, bind=0.0.0.0` → 立即退出并报错 |
+| S-05 | HIGH | `7c4df3b` | TLS 握手包在 `tokio::time::timeout(HANDSHAKE_TIMEOUT = 10s)` 里，超时只 `continue`，不阻塞 accept 循环 | 单连接不发 ClientHello 时服务仍可服务新连接 |
+| S-06 | HIGH | `da1ecc8` | CLI 与 MCP 在发凭据前先做一次未认证 `health()` 探针，未固定指纹时**拒绝登录**并打印 `--fingerprint` 指引；MCP 无终端可确认，一律拒绝 | 无 `RT_FINGERPRINT` 的 MCP 调用报 `refusing to send credentials over an unpinned TLS connection …` |
+| S-07 | HIGH | `7c4df3b` + `45f698c` | WS 出口 `mpsc::channel(256)` + `try_send`（丢弃计数、恢复时补发 error 帧）；exec 流式改 `tokio::sync::mpsc::channel(256)`，消费者消失或 1s 投不进即杀进程树 | `dropped_consumer_stops_the_reader_and_kills_the_child`、`stalled_consumer_aborts_the_run_and_reports_cancelled` |
+| S-08 | HIGH | `da1ecc8` | `pathscope` 新增 `PROTECTED` 集合与 `check_protected`（双向前缀判定 → `PolicyDenied`）；`bootstrap::install_control_path_guards` 保护 `config.toml`、`.bak`、`instance.lock`、审计文件、`data/tls` | `protected_control_paths_are_unreachable`；MCP 读 `config.toml` → 403 `policy_denied` |
+
+### 9.2 MEDIUM
+
+| ID | 级别 | 提交 | 修复要点 | 验证 |
+|---|---|---|---|---|
+| S-09 | MEDIUM | `bb48b8d` | `/fs/read` 写 `fs.read` 审计；每会话读预算 512 MiB/min（按令牌摘要计费，`/fs/download` 同计），超限 429 + `retry_after_secs` | `file_reads_are_recorded_in_the_audit_trail` |
+| S-10 | MEDIUM | `bb48b8d` | `middleware::origin_layer`：缺 `Host` → 400；Host 不在本机名/监听地址/白名单 → 403；`Origin` 必须与 Host 同源；`Sec-Fetch-Site: cross-site` → 403（DNS rebinding / CSRF 双封） | `request_host_and_origin_are_validated` |
+| S-11 | MEDIUM | `bb48b8d` | `X-Forwarded-For` 只在 peer 为回环/私网/链路本地时采用，否则忽略并限流式 `warn` | `forwarded_headers_are_only_trusted_from_a_local_peer` |
+| S-12 | MEDIUM | `589735f` | stdin 写入改为 spawn 后的独立 writer 线程 + 64 KiB 分片 + 与 deadline/取消联动；`READER_GRACE = 500ms` 收尾 | `large_stdin_cannot_outlive_the_deadline` |
+| S-13 | MEDIUM | `589735f` | Job Object（`CreateJobObjectW` + `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` + `AssignProcessToJobObject`，RAII），`taskkill` 降为兜底 | `grandchildren_are_reaped_when_the_run_ends`（含「禁用 attach 即失败」反证） |
+| S-14 | MEDIUM | `bb48b8d` | 凭据热重载：`AppState::credentials()` 每 1s 按配置 (mtime,len) 抽查，改配置即生效（吊销 API key 无需重启）；已签发会话不受影响 | `credential_changes_apply_without_a_restart` |
+| S-15 | MEDIUM | `6ff81b7` + `3895dc5` | 新模块 `rt-core/src/acl.rs`：`SetNamedSecurityInfoW` 写 `D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)`，收敛 TLS 私钥/证书/指纹文件、`config.toml`+`.bak`、`data/`、`tls/` | `acl::tests`；`restrict_to_current_user` 后 owner 仍可读写 |
+| S-16 | MEDIUM | `c9dca5f` | `ensure_capacity`：`free > incoming + 256 MiB`；流式每 64 MiB 复核，超限中止并删残留（`PayloadTooLarge`） | `capacity_check_rejects_a_payload_the_volume_cannot_hold` |
+| S-17 | MEDIUM | `3fcff23` | MCP 审批门：`rt_exec`/`rt_fs_write`/`rt_fs_delete`/`rt_fs_rename`/`rt_fs_copy`/`rt_fs_upload` 需操作者租约（`mcp-approvals.json`，默认关闭 = 需要租约），`remote-terminal approve <tool> --minutes N` / `--revoke` / `--list`，`RT_REQUIRE_APPROVAL=0` 可关 | `cargo test -p rt-app --lib approval`；真机已验证「拒绝 → approve → 成功 → revoke → 再拒」 |
+| S-18 | MEDIUM | `3fcff23` | `content_b64` 预检 64 MiB（按 base64 长度估算），超限提示改用 `rt_fs_upload` 流式 | `mcp::tools` 单测 |
+| S-19 | MEDIUM | `3fcff23` | 下载/截屏落盘强制约束在 `RT_DOWNLOAD_DIR`/`RT_CAPTURE_DIR` 内（大小写不敏感前缀判定） | `mcp::tools` 单测 |
+| S-20 | MEDIUM | `3fcff23` | `RT_INSECURE=1` 必须同时 `RT_ALLOW_PLAINTEXT=1`，否则忽略并 `warn` | `mcp::tools` 单测 |
+| S-21 | MEDIUM | `22cd845` + `bb48b8d` | `/sysinfo/processes`、`/capture/windows` 提升为 Full-only；`/sysinfo`、`/sysinfo/quick`、`/exec/shells` 保持 workspace 可用 | `process_listing_requires_full_scope` |
+| S-22 | MEDIUM | `bb48b8d` | 账号维度失败计数 50/h + 指数退避（1,2,4…≤900s，前 3 次免延迟）→ 429 + `Retry-After`；用户名小写归一 | `repeated_failures_back_off_per_account` |
+| S-23 | MEDIUM | `683f24d` + `d9f20f1` | `AppState` 持 `Arc<Semaphore>`（64 槽）作准入，超 2s → 503 + `Retry-After: 1`；所有 `spawn_blocking` 路径统一走 `spawn_blocking_admitted`；登录的 Argon2 不占预算；rt-app 阻塞池 32 → 64 对齐 | `requests_are_shed_when_every_blocking_slot_is_taken`、`admit_sheds_the_caller_when_every_slot_is_taken` |
+| S-24 | MEDIUM | `bb48b8d` | WS ticket 绑定签发方 IP、TTL 60s → 15s、仍一次性；IP 不符 403 | `websocket_tickets_are_bound_to_the_issuing_address` |
+| S-25 | MEDIUM | `7bc0323` + `3895dc5` + `83d7f94` | 审计轮转保留 `audit_max_files`（默认 10）份并清理更旧；新增 `log_checked()` 与 `audit_fail_closed`（默认 false）。服务端把**破坏性**动作（`exec.start` 与 `exec.run/success`、`fs.mkdir`/`delete`/`rename`/`copy`/`write`/`upload`）改为 `record_audit_required`，fail-closed 时写不进审计即 503 + `Retry-After: 1`（命令根本不会启动）；读路径与 `capture`/`auth`/WS 连接事件保持 best-effort，命令**失败**的结果也保留自身错误码而不被 503 覆盖 | `checked_audit_answers_unavailable_when_the_write_fails`、`best_effort_audit_never_blocks_the_request`、`fail_closed_auditing_still_serves_a_working_trail`、`exec_records_the_intent_before_the_command_runs` |
+
+### 9.3 LOW
+
+| ID | 级别 | 提交 | 修复要点 | 验证 |
+|---|---|---|---|---|
+| S-26 | LOW | `7bc0323` | `panic.log` 超 1 MiB 轮转为 `panic.log.1`（只留一份） | `logging` 单测 |
+| S-27 | LOW | `bb48b8d` | workspace 会话的 `/sysinfo` 把 `app.config_path`/`app.data_dir` 置空、`app.workspace_root` 置 `"\"` | `process_listing_requires_full_scope`（含路径隐藏断言） |
+| S-28 | LOW | `cab0518` | `device_stem()`：去尾空格、上标数字折叠、大写比对；`RESERVED` 补 `CONIN$`/`CONOUT$`/`CLOCK$` → `CON .txt`、`COM¹` 全部拒绝 | `rejects_device_name_variants` |
+| S-29 | LOW | `cab0518` | `is_hidden_format_char` 拒绝 `U+200B..200F`、`U+202A..202E`、`U+2066..2069`、`U+061C`、`U+FEFF` | `rejects_zero_width_and_bidi_characters` |
+| S-30 | LOW | `cab0518` | `C:`（无尾随分隔符）改为 `InvalidPath` 并提示用 `C:\` | `rejects_residual_drive_paths` |
+| S-31 | LOW | `c9dca5f` | 主路径用 `GetFinalPathNameByHandleW` 做句柄终态校验（不一致 → `PolicyDenied`）；`delete` 用「重新 resolve + 不跟随链接的句柄确认」，残余微秒窗口已写入函数文档 | `final_path_check_rejects_paths_outside_the_jail`、`a_junction_inside_the_jail_cannot_smuggle_io_outside` |
+| S-32 | LOW | `bb48b8d` | 登录失败统一 401「invalid username or password」，剩余次数只进审计/tracing | `login_failure_gives_one_uniform_answer` |
+| S-33 | LOW | `3895dc5` | `validate()` 对 `rate_limit_per_min == 0` 报 error、1..=9 报 warning | `config` 单测 |
+| S-34 | LOW | `3895dc5` | `write_atomic_with` 用随机临时名 + `create_new(true)` + 4 次重试 | `config` 单测 |
+| S-35 | LOW | `bb48b8d` | 审计尾部改为末尾 16 KiB 块倒读，只解析最后 N 条 | `tail_handles_files_larger_than_one_chunk` 等 4 条 |
+| S-36 | LOW | `3a20251` | MCP 错误文本截断 2 KiB + `… (truncated)`；CLI 无 TTY 时密码从 stdin 读（不进 argv） | `mcp` 单测 |
+| S-37 | LOW | `3a20251` | MCP stdin 单行 8 MiB 上限，超限回 JSON-RPC error 并跳过 | `mcp` 单测 |
+| S-38 | LOW | `3a20251` | 无 TTY 时 `read_password()` 读 stdin 一行；`--password` 保留但文档标注风险 | `cli` 单测 |
+| S-39 | LOW | `08ba6e5` | 统一响应层注入 `X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`、`X-Frame-Options: DENY`（覆盖 404/405 与错误信封） | `every_response_carries_the_hardening_headers` |
+| S-40 | LOW | `3a20251` | 保留 2024→2099 的有效期（固定指纹下可接受），新增 `crypto::rotate_self_signed_tls` 与 `remote-terminal rotate-cert`（旧文件留 `.old`，提示重新 pin） | `remote-terminal rotate-cert` |
+| S-41 | LOW | `fc8e332` | exec 审计 detail 改 `cmd=<前 200 字符>[…] sha256=<完整命令摘要>` | `command_audit_keeps_a_head_and_a_digest` |
+| S-42 | LOW | `d262414` + `0dccacf` | `taskkill` 三级解析：`GetSystemDirectoryW`（内核锚点）→ `%SystemRoot%\System32` → 裸名；Job Object 仍是主杀路径 | `taskkill_is_invoked_through_its_absolute_system_path` |
+
+### 9.4 保留的取舍（已评估、不修）
+
+| 条目 | 决定 | 理由 |
+|---|---|---|
+| `/capture/screens` 对 workspace 开放 | 保留 | 只返回显示器分辨率/缩放，不含像素内容；前端选屏需要 |
+| 证书 75 年有效期（S-40） | 保留 + 提供轮换 | 指纹固定模型下有效期不构成信任依据；需要时 `rotate-cert` |
+| `X-Forwarded-For` 默认不信任 | 保留 | 默认 `false`；开启后也只采信本地 peer |
+| Full 作用域 = 完全信任 | 保留 | 这是设计：Full 会话等价于在该机器上以服务账户身份操作，审计与审批门是主要约束手段 |
+| `delete` 的微秒级 TOCTOU 窗口（S-31） | 保留并文档化 | 远端无法在监狱内创建 junction；本地低权进程不在威胁模型内 |
+
+### 9.5 回归命令
+
+```powershell
+cargo test --workspace --all-targets          # 全量（core/server/app/client）
+cargo test -p rt-core --lib pathscope          # 路径监狱
+cargo test -p rt-core --test pathscope_adversarial   # 51 条越狱对抗用例
+cargo test -p rt-server --all-targets          # 鉴权/作用域/Host/Origin/准入
+cargo test -p rt-app --lib approval            # MCP 审批门
+cargo test -p rt-app --test e2e                # 真实 TLS 端到端 + 作用域边界
+```
