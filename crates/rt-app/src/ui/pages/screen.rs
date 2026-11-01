@@ -1,14 +1,28 @@
 //! Remote screen and window capture page.
 //!
-//! Previews are fetched as encoded image bytes, decoded with the `image` crate
-//! and uploaded into an egui texture. The "live preview" mode runs a repeating
-//! tokio task at 1–2 fps and stops itself on the first error.
+//! Two transports share one preview surface:
+//!
+//! * one-shot captures go through `POST /api/v1/capture` and keep the encoded
+//!   bytes so the user can save exactly what the server produced;
+//! * the live preview runs a dedicated WebSocket
+//!   ([`rt_client::ws::spawn_capture_stream`]) that pushes JPEG frames. The
+//!   stream is deliberately lossy — the worker drains with `latest_frame()` so
+//!   a slow paint never builds a backlog — and it falls back to on-demand
+//!   captures as soon as the server reports why it stopped.
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use egui::{RichText, TextureHandle, TextureOptions, Ui};
 use rt_protocol::capture::{CaptureRequest, CaptureTarget, ImageFormat, ScreenInfo, WindowInfo};
+
+/// Format and quality used by the live stream (saving still honours the
+/// per-capture options below).
+const LIVE_QUALITY: u8 = 70;
+/// Width cap for streamed frames; the server never enlarges a capture.
+const LIVE_MAX_WIDTH: u32 = 1280;
+/// How often the worker checks the stream for a newer frame.
+const LIVE_POLL: Duration = Duration::from_millis(40);
 
 use crate::ui::app::App;
 use crate::ui::theme::{self, palette, Space, Tone, Type};
@@ -39,11 +53,26 @@ struct Captured {
     encoded: Vec<u8>,
 }
 
-/// One live-preview frame.
+/// One live-preview frame, already decoded to RGBA8.
 struct LiveFrame {
     rgba: Vec<u8>,
     width: u32,
     height: u32,
+    /// Frames the stream skipped since the previous delivered frame.
+    skipped: u64,
+    /// Encoded size of this frame on the wire.
+    bytes: u64,
+    /// How long the server needed to grab it.
+    duration_ms: u64,
+}
+
+/// Lightweight counters shown under the preview while the stream runs.
+#[derive(Default, Clone, Copy)]
+struct LiveStats {
+    frames: u64,
+    skipped: u64,
+    last_ms: u64,
+    last_bytes: u64,
 }
 
 /// Messages produced by background capture jobs.
@@ -52,6 +81,8 @@ enum Event {
     Windows(Result<Vec<WindowInfo>, String>),
     Captured(Box<Result<Captured, String>>),
     Live(Box<Result<LiveFrame, String>>),
+    /// The stream ended; the string is the server-reported reason.
+    LiveStopped(String),
     Saved(Result<String, String>),
 }
 
@@ -71,11 +102,16 @@ pub struct State {
     quality: u8,
     max_width: u32,
     live: bool,
-    live_generation: u64,
+    /// Set while a stream worker runs; sending `true` asks it to shut down.
+    live_cancel: Option<tokio::sync::watch::Sender<bool>>,
+    /// Monotonic id so every stream gets its own `Unsubscribe` id.
+    live_stream_id: u64,
+    /// Requested stream frame rate (1..=15); the server clamps it further.
     live_fps: u8,
-    live_stop_rx: Option<tokio::sync::watch::Receiver<bool>>,
-    live_stop_tx: Option<tokio::sync::watch::Sender<bool>>,
+    live_stats: LiveStats,
     live_error: Option<(String, Instant)>,
+    /// Why the last stream ended, kept for a short banner.
+    live_stopped: Option<(String, Instant)>,
     tx: mpsc::Sender<Event>,
     rx: mpsc::Receiver<Event>,
     note: Option<(String, Instant)>,
@@ -98,11 +134,12 @@ impl Default for State {
             quality: 80,
             max_width: 1920,
             live: false,
-            live_generation: 0,
-            live_fps: 1,
-            live_stop_rx: None,
-            live_stop_tx: None,
+            live_cancel: None,
+            live_stream_id: 0,
+            live_fps: 2,
+            live_stats: LiveStats::default(),
             live_error: None,
+            live_stopped: None,
             tx,
             rx,
             note: None,
@@ -117,7 +154,7 @@ impl State {
             self.format = format;
         }
         self.quality = config.client.capture_quality.clamp(10, 100);
-        self.live_fps = config.client.capture_fps.clamp(1, 2);
+        self.live_fps = config.client.capture_fps.clamp(1, 15);
     }
 
     /// Called when the connection is dropped.
@@ -192,14 +229,19 @@ impl State {
                     Ok(frame) => {
                         if let Some(texture) = upload_rgba(app, &frame.rgba, frame.width, frame.height)
                         {
+                            self.live_stats.frames = self.live_stats.frames.saturating_add(1);
+                            self.live_stats.skipped =
+                                self.live_stats.skipped.saturating_add(frame.skipped);
+                            self.live_stats.last_ms = frame.duration_ms;
+                            self.live_stats.last_bytes = frame.bytes;
                             let format = self.format_label().to_string();
                             self.frame = Some(Frame {
                                 texture,
                                 format,
                                 width: frame.width,
                                 height: frame.height,
-                                bytes: frame.rgba.len(),
-                                duration_ms: 0,
+                                bytes: frame.bytes as usize,
+                                duration_ms: frame.duration_ms,
                                 target: "实时预览".to_string(),
                                 resized: true,
                             });
@@ -207,12 +249,24 @@ impl State {
                         }
                     }
                     Err(err) => {
-                        // Auto-stop on the first error.
+                        // A decode failure means we can no longer paint the
+                        // stream, so stop it and fall back to on-demand shots.
                         self.stop_live();
                         self.live_error = Some((err.clone(), Instant::now()));
                         app.fail(format!("实时预览已停止：{err}"));
                     }
                 },
+                Event::LiveStopped(reason) => {
+                    // The server told us why it stopped: report it verbatim and
+                    // fall back to one-shot captures instead of retrying.
+                    self.live = false;
+                    self.live_cancel = None;
+                    self.live_stopped = Some((reason.clone(), Instant::now()));
+                    app.toasts.warn(format!("实时流已停止：{reason}"));
+                    if self.frame.is_none() {
+                        self.capture(app);
+                    }
+                }
                 Event::Saved(result) => match result {
                     Ok(path) => {
                         self.note = Some((format!("已保存到 {path}"), Instant::now()));
@@ -281,54 +335,117 @@ impl State {
         });
     }
 
-    /// Starts the low-fps live preview loop.
+    /// Starts the WebSocket live preview.
+    ///
+    /// A dedicated worker owns the [`rt_client::ws::CaptureStream`], drains it
+    /// with `latest_frame()` (older frames are worthless for a preview) and
+    /// decodes off the UI thread. Any existing stream is stopped first so the
+    /// page can never accumulate sockets.
     fn start_live(&mut self, app: &mut App) {
         let Some(client) = app.client() else { return };
-        let interval = Duration::from_millis(1000 / self.live_fps.clamp(1, 2) as u64);
-        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-        self.live_stop_tx = Some(stop_tx);
-        self.live_stop_rx = Some(stop_rx.clone());
+        self.stop_live();
         self.live = true;
-        self.live_generation = self.live_generation.wrapping_add(1);
+        self.live_error = None;
+        self.live_stopped = None;
+        self.live_stats = LiveStats::default();
+        self.live_stream_id = self.live_stream_id.wrapping_add(1);
+        let id = self.live_stream_id;
+        let fps = self.live_fps.clamp(1, 15);
+        let request = CaptureRequest {
+            target: self.target.clone(),
+            format: ImageFormat::Jpeg,
+            quality: Some(LIVE_QUALITY),
+            max_width: Some(LIVE_MAX_WIDTH),
+            max_height: None,
+        };
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        self.live_cancel = Some(cancel_tx);
         let tx = self.tx.clone();
         app.spawn_task(async move {
-            let mut stop = stop_rx;
+            let mut stream = rt_client::ws::spawn_capture_stream(client, id, request, fps, None);
+            let mut cancel = cancel_rx;
+            let mut last_seq: Option<u64> = None;
             loop {
-                if *stop.borrow() {
+                if *cancel.borrow() {
                     break;
                 }
-                let bytes = client
-                    .capture_raw("primary", "jpeg", 60, Some(1280))
-                    .await
-                    .map_err(|err| err.message());
-                match bytes.and_then(|bytes| {
-                    decode(&bytes).ok_or_else(|| "帧数据无法解码".to_string())
-                }) {
-                    Ok((rgba, width, height)) => {
-                        if tx.send(Event::Live(Box::new(Ok(LiveFrame { rgba, width, height })))).is_err() {
+                if let Some(reason) = stream.poll_stop_reason() {
+                    let _ = tx.send(Event::LiveStopped(reason));
+                    break;
+                }
+                if let Some(frame) = stream.latest_frame() {
+                    let skipped = match last_seq {
+                        Some(previous) if frame.seq > previous => frame.seq - previous - 1,
+                        _ => 0,
+                    };
+                    last_seq = Some(frame.seq);
+                    let meta = frame.meta.clone();
+                    let encoded = match decode_b64(&frame.data_b64) {
+                        Some(bytes) => bytes,
+                        None => {
+                            let _ = tx.send(Event::Live(Box::new(Err(
+                                "帧数据不是有效的 base64".to_string(),
+                            ))));
                             break;
                         }
+                    };
+                    // Decoding is CPU bound: keep it off the UI and runtime threads.
+                    let decoded = tokio::task::spawn_blocking(move || decode(&encoded)).await;
+                    match decoded {
+                        Ok(Some((rgba, width, height))) => {
+                            let event = Event::Live(Box::new(Ok(LiveFrame {
+                                rgba,
+                                width,
+                                height,
+                                skipped,
+                                bytes: meta.bytes,
+                                duration_ms: meta.duration_ms,
+                            })));
+                            if tx.send(event).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => {
+                            let _ = tx.send(Event::Live(Box::new(Err(
+                                "帧数据无法解码".to_string()
+                            ))));
+                            break;
+                        }
+                        Err(_) => break,
                     }
-                    Err(err) => {
-                        let _ = tx.send(Event::Live(Box::new(Err(err))));
-                        break;
+                    // Paint the newest frame as soon as it is ready.
+                    tokio::select! {
+                        _ = tokio::time::sleep(LIVE_POLL) => {}
+                        _ = cancel.changed() => break,
                     }
-                }
-                tokio::select! {
-                    _ = tokio::time::sleep(interval) => {}
-                    _ = stop.changed() => {}
+                } else {
+                    tokio::select! {
+                        _ = tokio::time::sleep(LIVE_POLL) => {}
+                        _ = cancel.changed() => break,
+                    }
                 }
             }
         });
     }
 
-    /// Stops the live preview loop.
+    /// Stops the live stream (idempotent; the worker drops the socket).
     fn stop_live(&mut self) {
-        if let Some(tx) = self.live_stop_tx.take() {
-            let _ = tx.send(true);
+        if let Some(cancel) = self.live_cancel.take() {
+            let _ = cancel.send(true);
         }
-        self.live_stop_rx = None;
         self.live = false;
+    }
+
+    /// Restarts the stream after the target or frame rate changed.
+    fn restart_live(&mut self, app: &mut App) {
+        if self.live {
+            self.start_live(app);
+        }
+    }
+
+    /// Stops the stream when the page is hidden; called by the shell.
+    pub fn suspend_live(&mut self) {
+        self.stop_live();
     }
 
     /// Saves the current capture through the most faithful path available.
@@ -435,6 +552,14 @@ fn decode(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     let rgba = image.to_rgba8();
     let (width, height) = rgba.dimensions();
     Some((rgba.into_raw(), width, height))
+}
+
+/// Decodes the base64 payload carried by a streamed frame.
+fn decode_b64(data: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(data.as_bytes())
+        .ok()
 }
 
 /// Uploads decoded pixels into a texture.
@@ -549,9 +674,9 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
                         "screen.live",
                         live_label,
                         if state.live {
-                            "停止低帧率实时预览"
+                            "停止 WebSocket 实时流"
                         } else {
-                            "以 1–2 fps 持续截取，出错会自动停止"
+                            "通过 WebSocket 持续推送画面（1–15 fps），服务端停止时会自动退回按需截图"
                         },
                     )
                     .ghost(),
@@ -565,11 +690,47 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
                     }
                 }
                 if state.live {
-                    ui.add(egui::Slider::new(&mut state.live_fps, 1..=2).suffix(" fps"))
-                        .on_hover_text("实时预览帧率");
+                    let mut fps = state.live_fps as u32;
+                    ui.add(
+                        egui::DragValue::new(&mut fps)
+                            .range(1..=15)
+                            .suffix(" fps")
+                            .speed(0.1),
+                    )
+                    .on_hover_text("实时流帧率上限（服务端还会按 capture_max_fps 再夹一次）");
+                    let fps = fps.clamp(1, 15) as u8;
+                    if fps != state.live_fps {
+                        state.live_fps = fps;
+                        state.restart_live(app);
+                    }
                     widgets::badge(ui, "实时", Tone::Success);
                 }
             });
+            if state.live {
+                ui.add_space(Space::XS);
+                ui.horizontal_wrapped(|ui| {
+                    let stats = state.live_stats;
+                    widgets::caption(
+                        ui,
+                        &format!(
+                            "已收到 {} 帧 · 最近一帧 {} · 丢帧 {}",
+                            stats.frames,
+                            if stats.last_ms > 0 {
+                                rt_core::util::format_duration_ms(stats.last_ms)
+                            } else {
+                                "—".to_string()
+                            },
+                            stats.skipped
+                        ),
+                    );
+                    if stats.last_bytes > 0 {
+                        widgets::caption(
+                            ui,
+                            &format!("· 每帧约 {}", rt_core::util::format_bytes(stats.last_bytes)),
+                        );
+                    }
+                });
+            }
         });
 
         if let Some(error) = &state.error {
@@ -577,7 +738,18 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
         }
         if let Some((err, at)) = &state.live_error {
             if at.elapsed() < Duration::from_secs(12) {
-                widgets::note_banner(ui, &format!("实时预览已停止：{err}"));
+                widgets::note_banner(
+                    ui,
+                    &format!("实时流已停止：{err}，已退回按需截图"),
+                );
+            }
+        }
+        if let Some((reason, at)) = &state.live_stopped {
+            if at.elapsed() < Duration::from_secs(12) {
+                widgets::note_banner(
+                    ui,
+                    &format!("实时流已停止：{reason}，已退回按需截图"),
+                );
             }
         }
         if let Some((note, at)) = &state.note {
@@ -788,19 +960,16 @@ pub fn ui(app: &mut App, ui: &mut Ui) {
         if let Some((target, label)) = pick {
             state.target = target;
             state.target_label = label;
-            if state.live {
-                // Restart the stream against the new target.
-                state.stop_live();
-                state.start_live(app);
-            }
+            // A new target needs a new subscription id on the server.
+            state.restart_live(app);
         }
         if capture {
             state.capture(app);
         }
 
-        // Keep the live loop repainting regularly.
+        // Keep repainting while frames arrive; the worker drops stale frames.
         if state.live {
-            ui.ctx().request_repaint_after(Duration::from_millis(200));
+            ui.ctx().request_repaint_after(Duration::from_millis(66));
         }
     });
 }

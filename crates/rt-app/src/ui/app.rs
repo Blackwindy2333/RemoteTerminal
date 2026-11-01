@@ -856,7 +856,7 @@ impl App {
                         )
                         .clicked()
                         {
-                            self.page = Page::Dashboard;
+                            self.set_page(Page::Dashboard);
                         }
                     }
                 });
@@ -879,10 +879,15 @@ impl App {
             .show(root, |ui| {
                 self.sidebar_header(ui);
                 ui.add_space(Space::MD);
+                let mut target = None;
                 for page in Page::ALL {
                     if self.nav_item(ui, page) {
-                        self.page = page;
+                        target = Some(page);
                     }
+                }
+                if let Some(page) = target {
+                    // Applied after the loop so the borrow of `self` ends first.
+                    self.set_page(page);
                 }
                 ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
                     self.sidebar_footer(ui);
@@ -1138,6 +1143,19 @@ impl App {
             });
     }
 
+    /// Switches the visible page, stopping page-scoped background work.
+    ///
+    /// The screen page owns a WebSocket capture stream that must not outlive
+    /// its view, so leaving it shuts the stream down explicitly.
+    pub fn set_page(&mut self, page: Page) {
+        if self.page != page {
+            if self.page == Page::Screen {
+                self.screen.suspend_live();
+            }
+            self.page = page;
+        }
+    }
+
     /// Global keyboard shortcuts (page switching and refresh).
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let mut target = None;
@@ -1160,7 +1178,7 @@ impl App {
             }
         });
         if let Some(page) = target {
-            self.page = page;
+            self.set_page(page);
         }
     }
 }
