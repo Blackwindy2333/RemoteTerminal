@@ -194,6 +194,9 @@ impl Mode {
 struct ShellPlan {
     program: PathBuf,
     args: Vec<OsString>,
+    /// The script must be handed over as `-EncodedCommand` (base64 UTF-16LE)
+    /// instead of being appended to the command line verbatim.
+    encoded: bool,
 }
 
 /// Accumulated state of one output stream.
@@ -585,10 +588,12 @@ fn shell_plan(kind: &ShellKind) -> Result<ShellPlan> {
         ShellKind::Cmd => Ok(ShellPlan {
             program: require_shell("cmd.exe", ShellKind::Cmd)?,
             args: vec![OsString::from("/C")],
+            encoded: false,
         }),
         ShellKind::Powershell => Ok(ShellPlan {
             program: require_shell("powershell.exe", ShellKind::Powershell)?,
             args: command_args(&POWER_SHELL_PREFIX),
+            encoded: true,
         }),
         // PowerShell 7 is reported as unavailable when missing: silently
         // falling back to 5.1 would run the user's script in a different
@@ -596,6 +601,7 @@ fn shell_plan(kind: &ShellKind) -> Result<ShellPlan> {
         ShellKind::Pwsh => Ok(ShellPlan {
             program: require_shell("pwsh.exe", ShellKind::Pwsh)?,
             args: command_args(&PWSH_PREFIX),
+            encoded: true,
         }),
         ShellKind::Custom { program, args } => {
             let trimmed = program.trim();
@@ -616,17 +622,28 @@ fn shell_plan(kind: &ShellKind) -> Result<ShellPlan> {
             Ok(ShellPlan {
                 program: path,
                 args: args.iter().map(OsString::from).collect(),
+                encoded: false,
             })
         }
     }
 }
 
+/// Fixed switches that precede the command flag; the flag itself (`-Command`
+/// or `-EncodedCommand`) is chosen at spawn time.
 fn command_args(prefix: &[&str]) -> Vec<OsString> {
-    prefix
-        .iter()
-        .map(|flag| OsString::from(*flag))
-        .chain(std::iter::once(OsString::from("-Command")))
-        .collect()
+    prefix.iter().map(|flag| OsString::from(*flag)).collect()
+}
+
+/// Encodes a script for `-EncodedCommand`: base64 of UTF-16LE.
+///
+/// PowerShell re-parses a `-Command <text>` argument as a command line, so a
+/// script that itself starts with a quoted string loses those quotes
+/// (`"PS " + 2` arrives as `PS + 2`). The encoded form is handed over byte for
+/// byte, which also makes non-ASCII scripts independent of the console code page.
+fn encode_powershell_script(script: &str) -> String {
+    use base64::Engine as _;
+    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 fn require_shell(program: &str, kind: ShellKind) -> Result<PathBuf> {
@@ -1182,7 +1199,12 @@ fn execute(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    append_command(&mut command, &req.command);
+    if plan.encoded {
+        command.arg("-EncodedCommand");
+        command.arg(encode_powershell_script(&req.command));
+    } else {
+        append_command(&mut command, &req.command);
+    }
     for (key, value) in &req.env {
         command.env(key, value);
     }
@@ -1493,6 +1515,35 @@ mod tests {
         let result = run(&guard(), &req, &limits()).expect("run");
         assert_eq!(result.exit_code, 7);
         assert!(!result.timed_out);
+    }
+
+    /// A script that begins with a double-quoted string used to be re-parsed as
+    /// a command line, so the quotes were stripped and the run failed; the
+    /// encoded form must preserve them.
+    #[test]
+    fn script_starting_with_a_quoted_string_keeps_its_quotes() {
+        if !have_powershell() {
+            return;
+        }
+        let req = ExecRequest::new(ShellKind::Powershell, r#""PS " + 2"#);
+        let result = run(&guard(), &req, &limits()).expect("run");
+        assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+        assert_eq!(result.stdout.trim(), "PS 2");
+    }
+
+    #[test]
+    fn encoded_scripts_round_trip_as_utf16le() {
+        use base64::Engine as _;
+        let script = "Write-Output '中文'; \"x\"";
+        let encoded = super::encode_powershell_script(script);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("base64");
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        assert_eq!(String::from_utf16(&units).expect("utf16"), script);
     }
 
     /// UTF-8 bytes for 你好, written straight to stdout so the test does not
