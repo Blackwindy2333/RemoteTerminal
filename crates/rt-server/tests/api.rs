@@ -1499,3 +1499,94 @@ async fn every_response_carries_the_hardening_headers() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(headers["x-content-type-options"], "nosniff");
 }
+
+#[tokio::test]
+async fn command_audit_keeps_a_head_and_a_digest() {
+    let fx = Fixture::with_audit();
+    let token = fx.token("admin").await;
+    let command = "echo rt-audit";
+
+    let (status, _, body) = split(
+        fx.call(authed_json(
+            Method::POST,
+            "/api/v1/exec",
+            &token,
+            serde_json::json!({"shell": {"kind": "cmd"}, "command": command}),
+        ))
+        .await,
+    )
+    .await;
+    assert!(
+        status == StatusCode::OK || status == StatusCode::NOT_IMPLEMENTED,
+        "unexpected status {status}: {body}"
+    );
+
+    let path = fx.audit_file.clone().expect("audit trail");
+    let trail = std::fs::read_to_string(path).expect("read audit trail");
+    let record: Value = trail
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|value| value["action"] == "exec.run")
+        .expect("exec.run must be audited");
+    let expected_result = if status == StatusCode::OK {
+        "success"
+    } else {
+        "failure"
+    };
+    assert_eq!(record["result"], expected_result);
+    assert_eq!(record["username"], "admin");
+    let detail = record["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains(&format!("cmd={command}")),
+        "unexpected detail: {detail}"
+    );
+    let digest = rt_core::crypto::sha256_hex(command.as_bytes());
+    assert!(
+        detail.contains(&format!("sha256={digest}")),
+        "unexpected detail: {detail}"
+    );
+}
+
+#[tokio::test]
+async fn long_commands_are_truncated_but_still_verifiable() {
+    let fx = Fixture::with_audit();
+    let token = fx.token("admin").await;
+    let long_tail = "x".repeat(500);
+    let command = format!("echo {long_tail}");
+
+    let (status, _, body) = split(
+        fx.call(authed_json(
+            Method::POST,
+            "/api/v1/exec",
+            &token,
+            serde_json::json!({"shell": {"kind": "cmd"}, "command": command}),
+        ))
+        .await,
+    )
+    .await;
+    assert!(
+        status == StatusCode::OK || status == StatusCode::NOT_IMPLEMENTED,
+        "unexpected status {status}: {body}"
+    );
+
+    let path = fx.audit_file.clone().expect("audit trail");
+    let trail = std::fs::read_to_string(path).expect("read audit trail");
+    let record: Value = trail
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|value| value["action"] == "exec.run")
+        .expect("exec.run must be audited");
+    let detail = record["detail"].as_str().unwrap_or_default();
+    assert!(
+        !detail.contains(&"x".repeat(300)),
+        "the audit line kept the whole command: {detail}"
+    );
+    assert!(detail.contains('…'), "no truncation marker: {detail}");
+    let digest = rt_core::crypto::sha256_hex(command.as_bytes());
+    assert!(
+        detail.contains(&format!("sha256={digest}")),
+        "the digest must cover the untruncated command: {detail}"
+    );
+}

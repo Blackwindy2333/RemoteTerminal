@@ -62,9 +62,9 @@ pub(crate) async fn run(
                 ctx.audit("exec.run", "success")
                     .target(shell_label.clone())
                     .detail(format!(
-                        "exit={} cmd={}",
+                        "exit={} {}",
                         out.exit_code,
-                        truncate_for_audit(&summary.command, 400)
+                        audit_command(&summary.command)
                     ))
                     .request_id(request_id.clone()),
             );
@@ -82,9 +82,9 @@ pub(crate) async fn run(
                 ctx.audit("exec.run", "failure")
                     .target(shell_label)
                     .detail(format!(
-                        "{} cmd={}",
+                        "{} {}",
                         err.message(),
-                        truncate_for_audit(&summary.command, 400)
+                        audit_command(&summary.command)
                     ))
                     .request_id(request_id.clone()),
             );
@@ -94,12 +94,21 @@ pub(crate) async fn run(
     Ok(Json(result?))
 }
 
-/// Keeps audit lines readable while preserving the interesting head of a command.
-fn truncate_for_audit(text: &str, max_chars: usize) -> String {
-    let trimmed: String = text.chars().take(max_chars).collect();
-    if trimmed.chars().count() < text.chars().count() {
-        format!("{trimmed}…")
+/// Characters of a command kept verbatim in the audit trail.
+const AUDIT_COMMAND_HEAD: usize = 200;
+
+/// Audit summary of a command: a readable head plus a digest of the whole text.
+///
+/// The head tells an operator what ran, while the SHA-256 of the untruncated
+/// command lets them verify the exact text afterwards without storing secrets
+/// in the log.
+fn audit_command(command: &str) -> String {
+    let head: String = command.chars().take(AUDIT_COMMAND_HEAD).collect();
+    let truncated = head.chars().count() < command.chars().count();
+    let digest = rt_core::crypto::sha256_hex(command.as_bytes());
+    if truncated {
+        format!("cmd={head}… sha256={digest}")
     } else {
-        trimmed
+        format!("cmd={head} sha256={digest}")
     }
 }
