@@ -334,7 +334,7 @@ impl Bridge {
                 "rt_capture",
                 "Capture a remote screen or window as PNG/JPEG and save it locally.",
                 json!({
-                    "target": {"type": "string", "description": "primary | all | screen:<id> | window:<id>"},
+                    "target": {"type": "string", "description": "primary (default) | all | foreground | screen:<id> | window:<id>"},
                     "format": {"type": "string", "enum": ["png", "jpeg"]},
                     "quality": {"type": "integer", "description": "JPEG quality 1-100."},
                     "max_width": {"type": "integer"},
@@ -568,6 +568,22 @@ impl Bridge {
         let target = match arg_str(args, "target").as_deref() {
             None | Some("") | Some("primary") | Some("screen:primary") => CaptureTarget::Primary,
             Some("all") | Some("screens") => CaptureTarget::AllScreens,
+            Some("foreground") | Some("active") | Some("window:foreground") => {
+                let windows = self.client.windows().await.map_err(|err| err.message())?;
+                let window = windows
+                    .iter()
+                    .find(|w| w.is_foreground)
+                    .or_else(|| {
+                        windows
+                            .iter()
+                            .find(|w| w.is_visible && !w.is_minimized && w.width > 0)
+                    })
+                    .ok_or_else(|| {
+                        "no foreground window is available to capture on the remote desktop"
+                            .to_string()
+                    })?;
+                CaptureTarget::Window { id: window.id }
+            }
             Some(other) => parse_target(other)?,
         };
         let format = match arg_str(args, "format").as_deref() {
