@@ -300,18 +300,79 @@ pub struct AuditLog {
     path: PathBuf,
     file: Mutex<std::fs::File>,
     writes: std::sync::atomic::AtomicU64,
+    failures: std::sync::atomic::AtomicU64,
+    /// Rotated `audit.jsonl.<stamp>` files to keep; older ones are deleted
+    /// (S-25: rotation must not grow the disk without bound).
+    max_rotated_files: usize,
+    /// S-25: when true an audit failure is reported to checked callers so the
+    /// request can be refused with 503 instead of silently going unrecorded.
+    fail_closed: bool,
+    /// Rotate once the live file is larger than this (default 16 MiB).
+    rotate_bytes: u64,
+    /// Only look at the file size every N appended lines.
+    rotate_check_every: u64,
 }
 
 impl fmt::Debug for AuditLog {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AuditLog").field("path", &self.path).finish()
+        f.debug_struct("AuditLog")
+            .field("path", &self.path)
+            .finish()
     }
 }
 
 const AUDIT_ROTATE_BYTES: u64 = 16 * 1024 * 1024;
+/// Checking the size on every single append would stat the file per audit
+/// event; every 500 lines is often enough for a 16 MiB threshold.
+const AUDIT_ROTATE_CHECK_EVERY: u64 = 500;
+
+/// True for the `YYYYMMDD-HHMMSS` suffix we append to rotated audit files.
+/// Validating the shape (instead of a plain prefix match) keeps unrelated
+/// neighbours such as `audit.jsonl.tmp` out of the retention logic.
+fn is_rotation_stamp(stamp: &str) -> bool {
+    let bytes = stamp.as_bytes();
+    bytes.len() == 15
+        && bytes[8] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(i, b)| i == 8 || b.is_ascii_digit())
+}
 
 impl AuditLog {
+    /// Open with the production defaults: keep
+    /// [`crate::config::DEFAULT_AUDIT_MAX_FILES`] rotated files, best-effort
+    /// auditing (a write failure is logged, not propagated).
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with(path, crate::config::DEFAULT_AUDIT_MAX_FILES, false)
+    }
+
+    /// Open with explicit retention and failure policy.
+    ///
+    /// `max_rotated_files` bounds the on-disk footprint: after every rotation,
+    /// and once at open time, only the newest N `audit.jsonl.<stamp>` files are
+    /// kept (S-25). `fail_closed` only changes how failures are *reported* to
+    /// [`AuditLog::log_checked`] callers — [`AuditLog::log`] never returns an
+    /// error, so existing call sites keep working.
+    pub fn open_with(path: &Path, max_rotated_files: usize, fail_closed: bool) -> Result<Self> {
+        Self::open_limits(
+            path,
+            max_rotated_files,
+            fail_closed,
+            AUDIT_ROTATE_BYTES,
+            AUDIT_ROTATE_CHECK_EVERY,
+        )
+    }
+
+    /// Test seam: the rotate threshold and check cadence are configurable so
+    /// rotation and pruning can be exercised without writing 16 MiB.
+    fn open_limits(
+        path: &Path,
+        max_rotated_files: usize,
+        fail_closed: bool,
+        rotate_bytes: u64,
+        rotate_check_every: u64,
+    ) -> Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| RtError::io(dir.to_path_buf(), e))?;
         }
@@ -320,41 +381,119 @@ impl AuditLog {
             .append(true)
             .open(path)
             .map_err(|e| RtError::io(path.to_path_buf(), e))?;
-        Ok(Self {
+        let log = Self {
             path: path.to_path_buf(),
             file: Mutex::new(file),
             writes: std::sync::atomic::AtomicU64::new(0),
-        })
+            failures: std::sync::atomic::AtomicU64::new(0),
+            max_rotated_files: max_rotated_files.max(1),
+            fail_closed,
+            rotate_bytes: rotate_bytes.max(1),
+            rotate_check_every: rotate_check_every.max(1),
+        };
+        // A machine that has been rotating for months must not keep all of it.
+        let pruned = log.prune_rotated();
+        if pruned > 0 {
+            tracing::info!(
+                target: "rt_core::audit",
+                "pruned {pruned} old audit file(s); keeping {}",
+                log.max_rotated_files
+            );
+        }
+        if log.fail_closed {
+            tracing::info!(
+                target: "rt_core::audit",
+                "audit fail-closed is enabled: a failed audit write will be reported as an error"
+            );
+        }
+        Ok(log)
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// Number of rotated files this log is allowed to keep.
+    pub fn max_rotated_files(&self) -> usize {
+        self.max_rotated_files
+    }
+
+    /// Whether the caller must treat an audit failure as fatal (`S-25`).
+    pub fn fail_closed(&self) -> bool {
+        self.fail_closed
+    }
+
+    /// How many audit writes have failed since start-up.
+    pub fn failures(&self) -> u64 {
+        self.failures.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Append one JSON line. Never panics and never propagates errors upward:
     /// an audit write failure must not take down the operation, but it *is*
-    /// reported through `tracing`.
+    /// reported through `tracing` and counted in [`AuditLog::failures`].
     pub fn log(&self, event: AuditEvent) {
-        let line = match serde_json::to_string(&event) {
-            Ok(l) => l,
+        let _ = self.write_event(&event);
+    }
+
+    /// Append one JSON line, propagating the failure.
+    ///
+    /// Callers behind `logging.audit_fail_closed = true` use this to answer 503
+    /// instead of pretending the action was audited (S-25); the plain
+    /// [`AuditLog::log`] keeps the historical fire-and-forget contract.
+    pub fn log_checked(&self, event: AuditEvent) -> Result<()> {
+        self.write_event(&event)
+    }
+
+    fn write_event(&self, event: &AuditEvent) -> Result<()> {
+        let line = match serde_json::to_string(event) {
+            Ok(line) => line,
             Err(err) => {
                 tracing::error!(target: "rt_core::audit", "failed to encode audit event: {err}");
-                return;
+                self.failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(RtError::Internal(format!(
+                    "failed to encode audit event: {err}"
+                )));
             }
         };
-        if let Ok(mut file) = self.file.lock() {
-            if let Err(err) = writeln!(file, "{line}") {
-                tracing::error!(target: "rt_core::audit", "failed to write audit line: {err}");
-            }
-            let _ = file.flush();
-        }
-        let n = self
-            .writes
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if n % 500 == 0 {
+        // Rotate *before* appending, so the new line always lands in a fresh
+        // live file and never inside the file that just became a rotation.
+        let n = self.writes.load(std::sync::atomic::Ordering::Relaxed);
+        if n % self.rotate_check_every == 0 {
             self.rotate_if_needed();
         }
+        let mut guard = match self.file.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let appended = writeln!(guard, "{line}").and_then(|()| guard.flush());
+        drop(guard);
+        if let Err(err) = appended {
+            let failures = self
+                .failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            if self.fail_closed {
+                tracing::error!(
+                    target: "rt_core::audit",
+                    "audit write failed ({failures} so far) and audit_fail_closed = true: {err}"
+                );
+            } else {
+                tracing::error!(target: "rt_core::audit", "failed to write audit line: {err}");
+            }
+            // Mirror the intent anyway, so a normal log tail still shows the
+            // action that could not be audited.
+            self.mirror(event);
+            return Err(RtError::io(self.path.clone(), err));
+        }
+        self.writes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Mirror into the normal log at info so a single tail shows both.
+        self.mirror(event);
+        Ok(())
+    }
+
+    fn mirror(&self, event: &AuditEvent) {
         tracing::info!(
             target: "audit",
             action = %event.action,
@@ -370,13 +509,16 @@ impl AuditLog {
 
     fn rotate_if_needed(&self) {
         let too_big = std::fs::metadata(&self.path)
-            .map(|m| m.len() > AUDIT_ROTATE_BYTES)
+            .map(|m| m.len() > self.rotate_bytes)
             .unwrap_or(false);
         if !too_big {
             return;
         }
+        let Some(name) = self.path.file_name().and_then(|n| n.to_str()) else {
+            return;
+        };
         let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-        let rotated = self.path.with_extension(format!("jsonl.{stamp}"));
+        let rotated = self.path.with_file_name(format!("{name}.{stamp}"));
         if std::fs::rename(&self.path, &rotated).is_err() {
             return;
         }
@@ -389,6 +531,45 @@ impl AuditLog {
                 *guard = file;
             }
         }
+        // Retention: rotations must not accumulate forever (S-25).
+        let pruned = self.prune_rotated();
+        if pruned > 0 {
+            tracing::debug!(target: "rt_core::audit", "pruned {pruned} old audit file(s)");
+        }
+    }
+
+    /// Delete the oldest rotated audit files, keeping `max_rotated_files`.
+    /// Returns how many files were removed.
+    fn prune_rotated(&self) -> usize {
+        let (Some(dir), Some(name)) = (
+            self.path.parent(),
+            self.path.file_name().and_then(|n| n.to_str()),
+        ) else {
+            return 0;
+        };
+        let prefix = format!("{name}.");
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        let mut stamps: Vec<String> = entries
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().map(|t| t.is_file()).unwrap_or(false))
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter_map(|file_name| {
+                let stamp = file_name.strip_prefix(&prefix)?;
+                is_rotation_stamp(stamp).then(|| stamp.to_string())
+            })
+            .collect();
+        // The stamp is `YYYYMMDD-HHMMSS`, so name order is time order.
+        stamps.sort();
+        let excess = stamps.len().saturating_sub(self.max_rotated_files);
+        let mut pruned = 0;
+        for stamp in stamps.into_iter().take(excess) {
+            if std::fs::remove_file(dir.join(format!("{prefix}{stamp}"))).is_ok() {
+                pruned += 1;
+            }
+        }
+        pruned
     }
 }
 
@@ -451,10 +632,7 @@ pub fn init(cfg: &LoggingConfig, log_dir: &Path, console: bool) -> Result<Loggin
         .map_err(|e| RtError::Config(format!("failed to open log directory: {e}")))?;
     let (file_writer, worker) = tracing_appender::non_blocking(appender);
 
-    let file_layer = make_file_layer(
-        cfg,
-        SharedWriter::new(Box::new(file_writer)),
-    );
+    let file_layer = make_file_layer(cfg, SharedWriter::new(Box::new(file_writer)));
 
     let console_writer: Box<dyn Write + Send + Sync> = if console {
         Box::new(io::stderr())
@@ -486,10 +664,26 @@ pub fn init(cfg: &LoggingConfig, log_dir: &Path, console: bool) -> Result<Loggin
     }
 
     let audit = if cfg.audit {
-        match AuditLog::open(&cfg.audit_file) {
-            Ok(log) => Some(Arc::new(log)),
+        match AuditLog::open_with(&cfg.audit_file, cfg.audit_max_files, cfg.audit_fail_closed) {
+            Ok(log) => {
+                tracing::info!(
+                    target: "rt_core::audit",
+                    "audit log: {} (keeping {} rotated file(s), fail_closed = {})",
+                    log.path().display(),
+                    log.max_rotated_files(),
+                    log.fail_closed()
+                );
+                Some(Arc::new(log))
+            }
             Err(err) => {
-                tracing::warn!(target: "rt_core::audit", "audit log disabled: {err}");
+                if cfg.audit_fail_closed {
+                    tracing::error!(
+                        target: "rt_core::audit",
+                        "audit log unavailable with audit_fail_closed = true: {err}"
+                    );
+                } else {
+                    tracing::warn!(target: "rt_core::audit", "audit log disabled: {err}");
+                }
                 None
             }
         }
@@ -548,13 +742,23 @@ fn build_filter(cfg: &LoggingConfig) -> EnvFilter {
         }
     }
     // Keep noisy dependencies at arm's length.
-    for quiet in ["hyper=warn", "rustls=warn", "tungstenite=warn", "h2=warn", "reqwest=warn"] {
+    for quiet in [
+        "hyper=warn",
+        "rustls=warn",
+        "tungstenite=warn",
+        "h2=warn",
+        "reqwest=warn",
+    ] {
         if let Ok(d) = quiet.parse() {
             filter = filter.add_directive(d);
         }
     }
     filter
 }
+
+/// `panic.log` is rotated to `panic.log.1` once it reaches this size, so a
+/// crash loop cannot fill the disk (S-26). One backup is kept, no more.
+const PANIC_LOG_MAX_BYTES: u64 = 1024 * 1024;
 
 fn install_panic_hook(log_dir: &Path) {
     let path = log_dir.join("panic.log");
@@ -565,17 +769,41 @@ fn install_panic_hook(log_dir: &Path) {
             "[{}] panic: {info}\nbacktrace:\n{backtrace}\n",
             chrono::Local::now().to_rfc3339()
         );
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
-            let _ = f.write_all(line.as_bytes());
-            let _ = f.flush();
-        }
+        let _ = append_panic_record(&path, &line);
         tracing::error!(target: "rt_core::panic", "{info}");
         previous(info);
     }));
+}
+
+/// Append one panic record, rotating the current file to `<name>.1` first when
+/// it has reached [`PANIC_LOG_MAX_BYTES`]. Returns whether a rotation happened.
+fn append_panic_record(path: &Path, line: &str) -> io::Result<bool> {
+    let oversized = std::fs::metadata(path)
+        .map(|meta| meta.len() >= PANIC_LOG_MAX_BYTES)
+        .unwrap_or(false);
+    let rotated = if oversized {
+        rotate_panic_log(path)
+    } else {
+        false
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(line.as_bytes())?;
+    file.flush()?;
+    Ok(rotated)
+}
+
+/// Move `panic.log` to `panic.log.1`, replacing the previous backup.
+fn rotate_panic_log(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let rotated = path.with_file_name(format!("{name}.1"));
+    // Windows refuses to rename onto an existing file: drop the old backup.
+    let _ = std::fs::remove_file(&rotated);
+    std::fs::rename(path, &rotated).is_ok()
 }
 
 #[cfg(test)]
@@ -621,5 +849,161 @@ mod tests {
         let json = serde_json::to_string(&ev).expect("json");
         assert!(json.contains("\"action\":\"exec\""));
         assert!(json.contains("\"result\":\"ok\""));
+    }
+
+    fn rotated_names(dir: &Path, name: &str) -> Vec<String> {
+        let prefix = format!("{name}.");
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|file_name| {
+                file_name
+                    .strip_prefix(&prefix)
+                    .is_some_and(is_rotation_stamp)
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn rotation_stamps_are_strictly_recognised() {
+        assert!(is_rotation_stamp("20261101-083000"));
+        assert!(!is_rotation_stamp("20261101-08300"));
+        assert!(!is_rotation_stamp("20261101083000"));
+        assert!(!is_rotation_stamp("20261101_083000"));
+        assert!(!is_rotation_stamp("tmp"));
+    }
+
+    #[test]
+    fn audit_open_prunes_the_backlog_and_rotation_stays_bounded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.jsonl");
+        // Backlog from previous runs: five rotated files, a live file over the
+        // (test) rotation threshold, and an unrelated neighbour.
+        for stamp in [
+            "20240101-000000",
+            "20240102-000000",
+            "20240103-000000",
+            "20240104-000000",
+            "20240105-000000",
+        ] {
+            std::fs::write(dir.path().join(format!("audit.jsonl.{stamp}")), b"{}\n").expect("seed");
+        }
+        std::fs::write(dir.path().join("audit.jsonl.tmp"), b"junk").expect("seed neighbour");
+        std::fs::write(&path, vec![b'x'; 400]).expect("seed live");
+
+        let log = AuditLog::open_limits(&path, 2, false, 300, 1).expect("open");
+        assert_eq!(log.max_rotated_files(), 2);
+        assert!(!log.fail_closed());
+        // Opening trims the backlog to the two newest rotations.
+        assert_eq!(
+            rotated_names(dir.path(), "audit.jsonl"),
+            vec![
+                "audit.jsonl.20240104-000000".to_string(),
+                "audit.jsonl.20240105-000000".to_string()
+            ]
+        );
+
+        // The first append (check cadence = 1) sees an oversized live file,
+        // rotates it, and keeps only the two newest rotations.
+        log.log(AuditEvent::new("test.rotate", "ok"));
+        let names = rotated_names(dir.path(), "audit.jsonl");
+        assert_eq!(names.len(), 2, "rotation must stay bounded: {names:?}");
+        assert_eq!(names[0], "audit.jsonl.20240105-000000");
+        let fresh = names[1]
+            .strip_prefix("audit.jsonl.")
+            .expect("rotated prefix");
+        assert!(is_rotation_stamp(fresh), "unexpected name: {}", names[1]);
+        assert!(
+            fresh > "20240105-000000",
+            "the fresh rotation must sort last: {fresh}"
+        );
+
+        // The live file is new and holds exactly the appended event.
+        let live = std::fs::read_to_string(&path).expect("read live");
+        assert_eq!(live.lines().count(), 1);
+        assert!(live.contains("\"action\":\"test.rotate\""));
+        // The unrelated neighbour is never treated as a rotation.
+        assert!(dir.path().join("audit.jsonl.tmp").exists());
+    }
+
+    #[test]
+    fn audit_write_failure_is_reported_and_honours_fail_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.jsonl");
+        let log = AuditLog::open_with(&path, 10, true).expect("open");
+        assert!(log.fail_closed());
+        log.log(AuditEvent::new("test.ok", "ok"));
+        assert_eq!(log.failures(), 0);
+
+        // Force the next write to fail: swap the append handle for a read-only
+        // one. Without this a hook that never fails would go untested.
+        {
+            let mut guard = log.file.lock().expect("lock");
+            *guard = std::fs::File::open(&path).expect("read-only handle");
+        }
+        let err = log
+            .log_checked(AuditEvent::new("test.fail", "error"))
+            .expect_err("a failed audit write must be reported");
+        assert!(matches!(err, RtError::Io { .. }), "unexpected error: {err}");
+        assert_eq!(log.failures(), 1);
+
+        // The fire-and-forget path must not panic and still counts the failure.
+        log.log(AuditEvent::new("test.fail2", "error"));
+        assert_eq!(log.failures(), 2);
+    }
+
+    #[test]
+    fn audit_fail_open_still_reports_to_checked_callers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("audit.jsonl");
+        let log = AuditLog::open_with(&path, 1, false).expect("open");
+        assert!(!log.fail_closed());
+        assert_eq!(log.max_rotated_files(), 1);
+        {
+            let mut guard = log.file.lock().expect("lock");
+            *guard = std::fs::File::open(&path).expect("read-only handle");
+        }
+        assert!(log
+            .log_checked(AuditEvent::new("test.fail", "error"))
+            .is_err());
+        assert_eq!(log.failures(), 1);
+    }
+
+    #[test]
+    fn panic_log_rotates_into_a_single_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("panic.log");
+        let rotated = dir.path().join("panic.log.1");
+
+        // Small records just append; nothing rotates yet.
+        assert!(!append_panic_record(&path, "first\n").expect("append"));
+        assert!(!append_panic_record(&path, "second\n").expect("append"));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "first\nsecond\n"
+        );
+        assert!(!rotated.exists());
+
+        // A full file is rotated once and the new record starts a fresh file.
+        std::fs::write(&path, vec![b'x'; PANIC_LOG_MAX_BYTES as usize + 1]).expect("seed");
+        assert!(append_panic_record(&path, "after rotation\n").expect("append"));
+        assert_eq!(
+            std::fs::metadata(&rotated).expect("backup").len(),
+            PANIC_LOG_MAX_BYTES + 1
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "after rotation\n"
+        );
+
+        // A second rotation replaces the single backup instead of stacking.
+        std::fs::write(&path, vec![b'y'; PANIC_LOG_MAX_BYTES as usize + 1]).expect("seed");
+        assert!(append_panic_record(&path, "after second rotation\n").expect("append"));
+        let backup = std::fs::read_to_string(&rotated).expect("backup");
+        assert_eq!(backup.len(), PANIC_LOG_MAX_BYTES as usize + 1);
+        assert_eq!(backup.as_bytes()[0], b'y');
     }
 }
