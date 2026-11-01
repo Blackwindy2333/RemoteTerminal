@@ -29,15 +29,63 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let config_path = cli.config.clone();
 
     match command {
-        Command::Mcp => {
+        Command::Mcp { target } => {
             let runtime = rt_app::bootstrap::runtime()?;
-            let code = runtime.block_on(rt_app::mcp::run(config_path))?;
+            let code = runtime.block_on(rt_app::mcp::run(config_path, target))?;
             Ok(ExitCode::from(code as u8))
         }
-        Command::Fingerprint { address, timeout } => {
+        Command::McpConfig { target } => {
+            let boot = rt_app::bootstrap::bootstrap(config_path.as_deref(), cli.verbose, false)?;
+            let exe = std::env::current_exe()
+                .map_err(|e| anyhow::anyhow!("cannot locate this executable: {e}"))?;
+            let config_path = boot.paths.config_file.clone();
+            match rt_app::mcp::config_snippet(
+                boot.config(),
+                target.as_deref(),
+                &exe,
+                Some(&config_path),
+            ) {
+                Ok(snippet) => {
+                    println!("{}", snippet.json);
+                    for note in snippet.notes {
+                        eprintln!("note: {note}");
+                    }
+                    Ok(ExitCode::SUCCESS)
+                }
+                Err(err) => Err(anyhow::anyhow!("{err}")),
+            }
+        }
+        Command::Fingerprint {
+            address,
+            timeout,
+            save,
+            username,
+        } => {
             let runtime = rt_app::bootstrap::runtime()?;
             let fingerprint = runtime.block_on(fingerprint(&address, timeout))?;
             println!("{fingerprint}");
+            if let Some(name) = save {
+                let boot =
+                    rt_app::bootstrap::bootstrap(config_path.as_deref(), cli.verbose, false)?;
+                let (host, port) = split_address(&address, boot.config().server.port);
+                let remember = username.unwrap_or_else(|| name.clone());
+                let mut config = boot.config().clone();
+                {
+                    let entry = config.host_entry_mut(&host, port);
+                    entry.name = name.clone();
+                    entry.fingerprint = Some(fingerprint.clone());
+                    entry.username = remember.clone();
+                }
+                config
+                    .save_with_header(&boot.paths.config_file)
+                    .map_err(|e| anyhow::anyhow!("cannot save the profile: {e}"))?;
+                eprintln!();
+                eprintln!("saved profile `{name}` ({host}:{port}, user {remember})");
+                eprintln!(
+                    "register the MCP bridge with: args: [\"mcp\", \"{name}\"] and env RT_PASSWORD"
+                );
+                eprintln!("or run: remote-terminal mcp-config {name}");
+            }
             Ok(ExitCode::SUCCESS)
         }
         Command::Gui => {
@@ -618,6 +666,33 @@ fn resolve_config_arg(config: Option<PathBuf>) -> anyhow::Result<PathBuf> {    m
 }
 
 /// Connects with a throwaway TLS probe and reports the certificate fingerprint.
+/// Splits `host[:port]` for the saved-profile path (`[::1]:46666` included).
+fn split_address(address: &str, default_port: u16) -> (String, u16) {
+    let address = address.trim();
+    if let Some(rest) = address.strip_prefix('[') {
+        if let Some((host, tail)) = rest.split_once(']') {
+            let port = tail
+                .strip_prefix(':')
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(default_port);
+            return (host.to_string(), port);
+        }
+    }
+    match address.rsplit_once(':') {
+        Some((host, port))
+            if !host.is_empty()
+                && !host.ends_with(']')
+                && port.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            match port.parse::<u16>() {
+                Ok(port) => (host.to_string(), port),
+                Err(_) => (address.to_string(), default_port),
+            }
+        }
+        _ => (address.to_string(), default_port),
+    }
+}
+
 async fn fingerprint(address: &str, timeout_secs: u64) -> anyhow::Result<String> {
     use std::sync::Arc;
 

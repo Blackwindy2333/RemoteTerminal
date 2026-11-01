@@ -116,12 +116,15 @@ remote-terminal [--config PATH] [-v] <命令>
 
 gui                       桌面界面（默认）
 serve                     无界面 REST/WebSocket 服务端，Ctrl+C 停止
-mcp                       stdin/stdout 上的 MCP 服务（供 harness 工具调用）
+mcp [目标]                stdin/stdout 上的 MCP 服务（目标可省略：主机名 /
+                          user:pass@host:port#fp / rt://… ）
 config                    显示配置文件与数据目录的实际路径
 hash-password [密码]      生成可写进 config.toml 的 argon2id 密码哈希
 gen-key [名称] [--scope] [--write]
                           生成 API Key（只打印一次，配置里只保存摘要）
-fingerprint <host[:port]> 获取服务端 TLS 证书指纹
+fingerprint <host[:port]> [--save 名字] [--username 用户]
+                          获取服务端 TLS 证书指纹；--save 顺便存成 [[client.hosts]]
+mcp-config [目标]         打印可直接粘贴的 dsh-mcp.json 注册片段
 approve [工具] [--minutes N] [--revoke] [--list]
                           为破坏性 MCP 工具授予/查看/撤销限时审批
 rotate-cert               重新生成自签证书（旧文件留作 *.old，之后需重新固定指纹）
@@ -146,30 +149,46 @@ info                      打印远程服务端的身份信息
 
 * **REST/WebSocket：** 见 [`docs/API.md`](docs/API.md)，以及运行中服务端的
   `https://host:46666/api/v1/openapi.json`。
-* **MCP（harness）：** 把这个可执行文件注册成 stdio 服务：
+* **MCP（harness）：** 三步即可接入，注册项里只剩**一个密码**：
+
+```powershell
+# 1. 探测并保存为一台“主机”（指纹、端口、用户名一次性记住）
+.\remote-terminal.exe fingerprint 192.168.1.10:46666 --save office --username alice
+
+# 2. 打印可直接粘贴的注册片段（把服务器换成自己的路径即可）
+.\remote-terminal.exe mcp-config office
+```
 
 ```json
 {
   "version": 1,
   "servers": {
-    "remote-terminal": {
+    "office": {
       "transport": "stdio",
       "enabled": true,
       "command": "D:\\Tools\\RemoteTerminal\\remote-terminal.exe",
-      "args": ["mcp"],
-      "env": {
-        "RT_HOST": "192.168.1.10:46666",
-        "RT_PASSWORD": "…",
-        "RT_FINGERPRINT": "AB:CD:…（来自 remote-terminal fingerprint 192.168.1.10:46666）"
-      }
+      "args": ["--config", "C:\\Users\\me\\.config\\RemoteTerminal\\config.toml", "mcp", "office"],
+      "env": { "RT_PASSWORD": "账号密码" }
     }
   }
 }
 ```
 
-> MCP 侧没有终端可以让人确认证书，因此**未固定指纹的 TLS 连接一律拒绝发送密码**：首次登录前
-> 必须先设置 `RT_FINGERPRINT`（或 `[[client.hosts]]` 里的 `fingerprint`）。没设置时工具会返回
-> 错误并附上它看到的指纹，复制过来即可，只需两步。
+地址、端口、指纹、用户名都在 `config.toml` 的 `[[client.hosts]]` 里，注册项不再需要
+`RT_HOST` / `RT_PORT` / `RT_FINGERPRINT` / `RT_USER`。只配了一台主机时连名字都可以省掉
+（`"args": ["--config", "…\\config.toml", "mcp"]`）。
+
+不想保存主机也可以直接内联一个目标，同样只需要一个变量：
+
+| 目标写法 | 例子 |
+| --- | --- |
+| 已保存的主机名 | `mcp office` |
+| `用户:密码@主机:端口#指纹` | `mcp "alice:secret@192.168.1.10:46666#ABCD…"` |
+| URL | `mcp "rt://alice:secret@192.168.1.10:46666?fp=ABCD…"` |
+| 只给地址 | `mcp "192.168.1.10:46666#ABCD…"`（用户名/密码走 `RT_USER`/`RT_PASSWORD`） |
+
+> MCP 侧没有终端可以让人确认证书，因此**未固定指纹的 TLS 连接一律拒绝发送密码**：用
+> `fingerprint … --save <名字>` 存过一次指纹，或直接在目标里写 `#<指纹>` 即可。
 
 ### 破坏性工具的审批门
 
@@ -189,12 +208,14 @@ MCP 是被模型驱动的，一次提示注入或一次幻觉调用就等于在�
 
 ### MCP 相关环境变量
 
+只保留了「必须由环境给」的几项（地址类信息建议写进 `config.toml` 的主机）：
+
 | 变量 | 作用 |
 | --- | --- |
-| `RT_HOST` / `RT_PORT` | 目标地址，可写成 `host:port` |
-| `RT_USER` / `RT_PASSWORD` | 密码登录 |
+| `RT_PASSWORD` | 账号密码（配合已保存的主机名使用） |
 | `RT_TOKEN` | 用 API Key 代替密码 |
-| `RT_FINGERPRINT` | 固定的证书指纹（**推荐，首次登录前必须**） |
+| `RT_TARGET` | 覆盖注册项里的目标（名字 / `user:pass@host:port#fp` / `rt://…`） |
+| `RT_HOST` / `RT_PORT` / `RT_USER` / `RT_FINGERPRINT` | 旧式逐项覆盖，仍然支持 |
 | `RT_REQUIRE_APPROVAL` | `0` 关闭破坏性工具审批门（默认开启） |
 | `RT_DOWNLOAD_DIR` / `RT_CAPTURE_DIR` | 本地下载、截图允许写入的目录（默认当前工作目录） |
 | `RT_INSECURE` + `RT_ALLOW_PLAINTEXT` | 两个都要设为 `1` 才允许明文连接（不建议） |

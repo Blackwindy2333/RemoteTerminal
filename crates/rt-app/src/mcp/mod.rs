@@ -5,19 +5,25 @@
 //! to stdout: logs go to the log file and to stderr, so the harness can talk to
 //! this process safely.
 //!
+//! The shortest way to register it is a saved host profile — one argument, one
+//! secret:
+//!
 //! ```json
-//! { "command": "remote-terminal.exe", "args": ["mcp"],
-//!   "env": { "RT_HOST": "192.168.1.10", "RT_PASSWORD": "..." } }
+//! { "command": "remote-terminal.exe", "args": ["mcp", "final"],
+//!   "env": { "RT_PASSWORD": "..." } }
 //! ```
 //!
-//! `RT_HOST` may include the port (`192.168.1.10:46666`), `RT_TOKEN` may carry an
-//! API key instead of a password, and `RT_FINGERPRINT` pins the TLS certificate
-//! (recommended: run `remote-terminal.exe fingerprint <host>:<port>` once).
+//! Save the profile once with `remote-terminal.exe fingerprint <host>:<port>
+//! --save final` (it stores host, port, user name and the pinned certificate
+//! fingerprint in `config.toml`). `remote-terminal.exe mcp-config` prints the
+//! whole snippet, ready to paste. Without a profile the target can be given
+//! inline as `user@host:port` or `rt://user:pass@host:port?fp=…`; the individual
+//! `RT_*` variables still work as a last resort.
 
 pub mod approval;
 pub mod tools;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -35,7 +41,10 @@ const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_CHARS: usize = 2000;
 
 /// Runs the stdio bridge until stdin closes. Returns a process exit code.
-pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<i32> {
+///
+/// `target` is the optional one-string target: a saved profile name, or
+/// `user@host:port`, or `rt://user:pass@host:port?fp=…`.
+pub async fn run(config_path: Option<PathBuf>, target: Option<String>) -> anyhow::Result<i32> {
     let loaded = rt_core::config::load_or_create(config_path.as_deref())
         .map_err(|e| anyhow::anyhow!("cannot load config: {e}"))?;
     let paths = rt_core::config::ResolvedPaths::resolve(&loaded.config, &loaded.base_dir);
@@ -49,7 +58,15 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<i32> {
         "MCP bridge starting (stdio transport)"
     );
 
-    let endpoint = Endpoint::resolve(&loaded.config);
+    // A bad target must not kill the bridge: the tools still answer, they just
+    // explain what to fix (the harness shows that text to the model).
+    let (endpoint, target_error) = match Endpoint::resolve_with(&loaded.config, target.as_deref()) {
+        Ok(endpoint) => (endpoint, None),
+        Err(err) => {
+            tracing::error!(error = %err, "cannot resolve the MCP target");
+            (Endpoint::resolve(&loaded.config), Some(err))
+        }
+    };
     tracing::info!(
         host = %endpoint.host,
         port = endpoint.port,
@@ -82,7 +99,8 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<i32> {
         endpoint,
         approvals,
         bridge: None,
-        connect_error: None,
+        target_invalid: target_error.is_some(),
+        connect_error: target_error,
     };
 
     let stdin = tokio::io::stdin();
@@ -125,11 +143,142 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<i32> {
     Ok(0)
 }
 
+/// A ready-to-paste MCP registration plus the caveats worth knowing.
+#[derive(Debug)]
+pub struct Snippet {
+    pub json: String,
+    pub notes: Vec<String>,
+}
+
+/// Builds the `dsh-mcp.json` entry for this executable.
+///
+/// With a saved profile the args are just `["mcp", "<profile>"]` and the only
+/// secret left is `RT_PASSWORD`, which keeps the harness entry short.
+pub fn config_snippet(
+    config: &rt_core::config::Config,
+    target: Option<&str>,
+    exe: &Path,
+    config_path: Option<&Path>,
+) -> std::result::Result<Snippet, String> {
+    let raw = target.map(str::trim).filter(|t| !t.is_empty());
+    let profile = match raw {
+        Some(raw) => config
+            .client
+            .hosts
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case(raw)),
+        None => config
+            .client
+            .hosts
+            .iter()
+            .find(|h| h.auto_connect)
+            .or_else(|| config.client.hosts.first()),
+    };
+
+    let (label, argument) = match (raw, profile) {
+        (Some(raw), Some(saved)) => (saved.name.clone(), raw.to_string()),
+        (None, Some(saved)) => (saved.name.clone(), saved.name.clone()),
+        // An inline target already carries everything the profile would.
+        (Some(raw), None) => (raw.to_string(), raw.to_string()),
+        (None, None) => {
+            return Err(
+                "no saved host yet: run `remote-terminal fingerprint <host>:port --save <name>` \
+                 (or `remote-terminal mcp-config --target user@host:port`)"
+                    .to_string(),
+            )
+        }
+    };
+
+    let mut notes = Vec::new();
+    if let Some(saved) = profile {
+        if saved.fingerprint.is_none() {
+            notes.push(format!(
+                "profile `{}` has no pinned fingerprint yet; run \
+                 `remote-terminal fingerprint {} --save {}` so the bridge can verify the server \
+                 before it sends the password",
+                saved.name, saved.name, saved.name
+            ));
+        }
+    } else if !argument.contains('#') && !argument.contains("fp=") {
+        notes.push(
+            "the target has no certificate fingerprint; pin it (`#<hex>`, `?fp=<hex>`, or \
+             RT_FINGERPRINT) or the bridge will refuse to send the password"
+                .to_string(),
+        );
+    }
+    notes.push(
+        "replace REPLACE_WITH_THE_PASSWORD with the account password, or use \
+         \"RT_TOKEN\": \"rt_…\" instead of RT_PASSWORD"
+            .to_string(),
+    );
+
+    let name: String = label
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_lowercase().next().unwrap_or(c)
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let name = name.trim_matches('-');
+    let name = if name.is_empty() {
+        "remote-terminal"
+    } else {
+        name
+    };
+
+    let cwd = exe
+        .parent()
+        .map(|dir| dir.display().to_string())
+        .unwrap_or_default();
+    // The bridge resolves `config.toml` from its working directory, so a config
+    // living anywhere else has to be named explicitly or a second, empty config
+    // would be created next to the executable.
+    let needs_config_flag = config_path
+        .map(|path| {
+            let dir = path.parent().unwrap_or(Path::new(""));
+            !dir.as_os_str().is_empty() && dir != Path::new(&cwd)
+        })
+        .unwrap_or(false);
+    let mut args = Vec::new();
+    if needs_config_flag {
+        if let Some(path) = config_path {
+            args.push("--config".to_string());
+            args.push(path.display().to_string());
+        }
+    }
+    args.push("mcp".to_string());
+    args.push(argument.clone());
+
+    let mut entry = serde_json::Map::new();
+    entry.insert("transport".into(), json!("stdio"));
+    entry.insert("enabled".into(), json!(true));
+    entry.insert("command".into(), json!(exe.display().to_string()));
+    entry.insert("args".into(), json!(args));
+    entry.insert(
+        "env".into(),
+        json!({ "RT_PASSWORD": "REPLACE_WITH_THE_PASSWORD" }),
+    );
+    entry.insert("cwd".into(), json!(cwd));
+    let mut servers = serde_json::Map::new();
+    servers.insert(name.to_string(), serde_json::Value::Object(entry));
+    let snippet = json!({ "version": 1, "servers": servers });
+    let json = serde_json::to_string_pretty(&snippet)
+        .map_err(|e| format!("cannot render the snippet: {e}"))?;
+    Ok(Snippet { json, notes })
+}
+
 struct McpState {
     endpoint: Endpoint,
     approvals: Approvals,
     bridge: Option<Bridge>,
+    /// Set when the target or the connection failed; every tool call reports it
+    /// instead of silently talking to the wrong machine.
     connect_error: Option<String>,
+    /// The stored error came from resolving the target, so retrying cannot help.
+    target_invalid: bool,
 }
 
 impl McpState {
@@ -138,6 +287,11 @@ impl McpState {
     /// later call retries.
     async fn ensure_bridge(&mut self) -> Result<&Bridge, String> {
         if self.bridge.is_none() {
+            // A bad target is a configuration error, not a transient one:
+            // retrying would connect to the fallback host instead.
+            if let Some(err) = self.fatal_error() {
+                return Err(err);
+            }
             match Bridge::connect(self.endpoint.clone(), self.approvals.clone()).await {
                 Ok(bridge) => {
                     tracing::info!(
@@ -156,6 +310,15 @@ impl McpState {
             }
         }
         Ok(self.bridge.as_ref().expect("bridge set above"))
+    }
+
+    /// The stored error when it came from resolving the target.
+    fn fatal_error(&self) -> Option<String> {
+        if self.target_invalid {
+            self.connect_error.clone()
+        } else {
+            None
+        }
     }
 
     async fn handle(&mut self, request: Value) -> Option<Value> {
@@ -320,6 +483,7 @@ mod tests {
             approvals: Approvals::resolve(&dir),
             bridge: None,
             connect_error: None,
+            target_invalid: false,
         }
     }
 
@@ -402,5 +566,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reply["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn snippet_uses_the_profile_name_and_one_secret() {
+        let mut cfg = rt_core::config::Config::default();
+        cfg.client.hosts.push(rt_core::config::HostConfig {
+            name: "书房的 工作站".into(),
+            host: "10.0.0.5".into(),
+            port: 6000,
+            fingerprint: Some("ab".repeat(32)),
+            username: "alice".into(),
+            last_scope: None,
+            last_connected: None,
+            auto_connect: true,
+        });
+        let exe = std::path::Path::new(r"C:\apps\remote-terminal.exe");
+        let snippet = config_snippet(&cfg, None, exe, None).expect("snippet");
+        let value: Value = serde_json::from_str(&snippet.json).expect("valid json");
+        let servers = value["servers"].as_object().expect("servers");
+        assert_eq!(servers.len(), 1);
+        // The profile name is kebab-cased so it stays a safe JSON key.
+        let entry = servers.values().next().unwrap();
+        assert_eq!(entry["args"], json!(["mcp", "书房的 工作站"]));
+        assert_eq!(entry["transport"], "stdio");
+        assert_eq!(entry["command"], json!(r"C:\apps\remote-terminal.exe"));
+        assert_eq!(entry["cwd"], json!(r"C:\apps"));
+        assert_eq!(entry["env"]["RT_PASSWORD"], "REPLACE_WITH_THE_PASSWORD");
+        assert!(value["servers"]["书房的-工作站"].is_object());
+        // A pinned profile needs no fingerprint note, only the password hint.
+        assert_eq!(snippet.notes.len(), 1, "{:?}", snippet.notes);
+    }
+
+    #[test]
+    fn snippet_names_a_missing_pin() {
+        let mut cfg = rt_core::config::Config::default();
+        cfg.client.hosts.push(rt_core::config::HostConfig {
+            name: "final".into(),
+            host: "10.0.0.5".into(),
+            port: 6000,
+            fingerprint: None,
+            username: "alice".into(),
+            last_scope: None,
+            last_connected: None,
+            auto_connect: true,
+        });
+        let exe = std::path::Path::new(r"C:\apps\remote-terminal.exe");
+        let snippet = config_snippet(&cfg, Some("final"), exe, None).expect("snippet");
+        assert!(
+            snippet.notes.iter().any(|n| n.contains("fingerprint")),
+            "{:?}",
+            snippet.notes
+        );
+    }
+
+    #[test]
+    fn snippet_explains_what_to_do_without_any_host() {
+        let cfg = rt_core::config::Config::default();
+        let err = config_snippet(&cfg, None, std::path::Path::new("rt.exe"), None).expect_err("no host");
+        assert!(err.contains("--save"), "{err}");
     }
 }

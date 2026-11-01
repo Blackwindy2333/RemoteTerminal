@@ -48,7 +48,25 @@ pub enum Command {
     Serve,
 
     /// Run the MCP bridge on stdin/stdout so harness tools can call this machine.
-    Mcp,
+    ///
+    /// The optional target keeps the harness entry short: a saved host profile
+    /// name from `config.toml` (`mcp final`), or an inline `user@host:port`, or
+    /// a full `rt://user:pass@host:port?fp=…`. Without it the bridge falls back
+    /// to the `RT_TARGET`/`RT_HOST` variables and then to the first saved host.
+    Mcp {
+        /// Saved host profile name, or `user@host:port`, or `rt://…`.
+        target: Option<String>,
+    },
+
+    /// Print a ready-to-paste MCP registration for this executable.
+    ///
+    /// The snippet is a complete `dsh-mcp.json` fragment: `args` carries one
+    /// profile name, so only the password (or API key) has to be filled in.
+    #[command(name = "mcp-config")]
+    McpConfig {
+        /// Saved host profile name, or `user@host:port`, or `rt://…`.
+        target: Option<String>,
+    },
 
     /// Show which configuration file would be used, creating it when missing.
     Config,
@@ -75,12 +93,22 @@ pub enum Command {
     },
 
     /// Fetch the TLS certificate fingerprint of a running server.
+    ///
+    /// With `--save NAME` the result is also written to `config.toml` as a
+    /// `[[client.hosts]]` profile, so the MCP bridge can be registered with
+    /// `args: ["mcp", "NAME"]` alone.
     Fingerprint {
         /// `host` or `host:port`.
         address: String,
         /// Seconds to wait for the TLS handshake.
         #[arg(long, default_value_t = 10)]
         timeout: u64,
+        /// Store the result as a saved host profile with this name.
+        #[arg(long)]
+        save: Option<String>,
+        /// User name to remember for that profile.
+        #[arg(long)]
+        username: Option<String>,
     },
 
     /// Regenerate the self-signed TLS certificate (S-40).
@@ -189,7 +217,8 @@ impl Command {
         match self {
             Command::Gui => "gui",
             Command::Serve => "serve",
-            Command::Mcp => "mcp",
+            Command::Mcp { .. } => "mcp",
+            Command::McpConfig { .. } => "mcp-config",
             Command::Config => "config",
             Command::HashPassword { .. } => "hash-password",
             Command::GenKey { .. } => "gen-key",
@@ -204,7 +233,7 @@ impl Command {
 
     /// Commands that must not initialise console logging (stdout is a protocol).
     pub fn wants_console_log(&self) -> bool {
-        !matches!(self, Command::Mcp)
+        !matches!(self, Command::Mcp { .. } | Command::McpConfig { .. })
     }
 }
 
@@ -247,7 +276,22 @@ mod tests {
 
     #[test]
     fn mcp_suppresses_console_logging() {
-        assert!(!Command::Mcp.wants_console_log());
+        assert!(!Command::Mcp { target: None }.wants_console_log());
+        assert!(!Command::McpConfig { target: None }.wants_console_log());
         assert!(Command::Gui.wants_console_log());
+    }
+
+    #[test]
+    fn mcp_accepts_a_single_target_argument() {
+        let cli = Cli::parse_from(["remote-terminal", "mcp", "final"]);
+        match cli.command.unwrap() {
+            Command::Mcp { target } => assert_eq!(target.as_deref(), Some("final")),
+            other => panic!("unexpected: {other:?}"),
+        }
+        let bare = Cli::parse_from(["remote-terminal", "mcp"]);
+        match bare.command.unwrap() {
+            Command::Mcp { target } => assert!(target.is_none()),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }

@@ -7,13 +7,23 @@
 //! Credentials are never stored by the bridge; it reads them from the config
 //! file (host entry) plus environment overrides:
 //!
+//! Connection settings come from one of three places, simplest first:
+//!
+//! * a **profile name** saved in `config.toml` (`args: ["mcp", "final"]`) —
+//!   host, port, user name and the pinned certificate fingerprint all live in
+//!   the file, so the harness entry only needs the password;
+//! * a **compact target** (`user@host:port`, `rt://user:pass@host:port?fp=…`);
+//! * the individual `RT_*` variables below (kept for compatibility).
+//!
+//! * `RT_TARGET` — the compact target, when passing it as an argument is not
+//!   convenient
 //! * `RT_HOST` / `REMOTE_TERMINAL_HOST` — `host` or `host:port`
 //! * `RT_PORT` — port when the host has none
 //! * `RT_USER` / `RT_PASSWORD` — password login
 //! * `RT_TOKEN` — API key (`rt_...`) instead of a password
 //! * `RT_FINGERPRINT` — pinned certificate fingerprint
 //! * `RT_INSECURE=1` — allow a plaintext HTTP connection (also needs
-//!   `RT_ALLOW_PLAINTEXT=1`, see [`Endpoint::resolve`])
+//!   `RT_ALLOW_PLAINTEXT=1`, see [`Endpoint::resolve_with`])
 //! * `RT_REQUIRE_APPROVAL=0` — disable the destructive-tool approval gate
 //! * `RT_DOWNLOAD_DIR` / `RT_CAPTURE_DIR` — sandbox for files written locally
 
@@ -52,9 +62,262 @@ fn env_first(keys: &[&str]) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// Fields a compact target string can carry. Every field is optional so the
+/// same parser serves `final`, `alice@host:port` and the full URL form.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct TargetSpec {
+    host: Option<String>,
+    port: Option<u16>,
+    tls: Option<bool>,
+    fingerprint: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+    token: Option<String>,
+}
+
+/// Parses the one-string form of a target.
+///
+/// Accepted shapes, first match wins:
+///
+/// * `final` — a saved host **profile** from `[[client.hosts]]` in `config.toml`
+///   (host, port, pinned fingerprint and user name all come from the file);
+/// * `alice@10.0.0.5:46666` / `alice:secret@10.0.0.5:46666#AABB…`;
+/// * `rt://alice:secret@10.0.0.5:46666?fp=AABB…` (TLS, default) or
+///   `http://10.0.0.5:46666` (plaintext, needs `RT_ALLOW_PLAINTEXT=1`);
+/// * `10.0.0.5:46666`, `[::1]:46666` or a bare host.
+fn parse_connection_target(raw: &str, cfg: &Config) -> std::result::Result<TargetSpec, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(TargetSpec::default());
+    }
+
+    // 1. URL form: scheme://[user[:password]@]host[:port][?query]
+    if let Some((scheme, rest)) = raw.split_once("://") {
+        let mut spec = match scheme.to_ascii_lowercase().as_str() {
+            "rt" | "rts" | "remote-terminal" | "remote_terminal" => TargetSpec {
+                tls: Some(true),
+                ..TargetSpec::default()
+            },
+            "https" | "wss" => TargetSpec {
+                tls: Some(true),
+                ..TargetSpec::default()
+            },
+            "http" | "ws" => TargetSpec {
+                tls: Some(false),
+                ..TargetSpec::default()
+            },
+            other => {
+                return Err(format!(
+                    "unsupported scheme `{other}://`; use rt:// (TLS) or http:// (plaintext)"
+                ))
+            }
+        };
+        let (rest, query) = match rest.split_once('?') {
+            Some((rest, query)) => (rest, Some(query)),
+            None => (rest, None),
+        };
+        // `userinfo@authority` — the user name and password may themselves
+        // contain `:`, so split at the last `@`.
+        match rest.rsplit_once('@') {
+            Some((userinfo, authority)) => {
+                let (user, password) = match userinfo.split_once(':') {
+                    Some((user, password)) => (user, Some(password.to_string())),
+                    None => (userinfo, None),
+                };
+                if !user.trim().is_empty() {
+                    spec.username = Some(url_decode(user));
+                }
+                spec.password = password.map(|p| url_decode(&p));
+                parse_authority(authority, &mut spec)?;
+            }
+            None => parse_authority(rest, &mut spec)?,
+        }
+        if let Some(query) = query {
+            for pair in query.split('&').filter(|p| !p.is_empty()) {
+                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                let value = url_decode(value);
+                match key.to_ascii_lowercase().as_str() {
+                    "fp" | "fingerprint" => spec.fingerprint = Some(value),
+                    "insecure" | "plaintext" => {
+                        spec.tls = Some(!matches!(
+                            value.to_ascii_lowercase().as_str(),
+                            "1" | "true" | "yes"
+                        ))
+                    }
+                    "tls" => {
+                        spec.tls = Some(matches!(
+                            value.to_ascii_lowercase().as_str(),
+                            "1" | "true" | "yes"
+                        ))
+                    }
+                    "token" | "api_key" | "key" => spec.token = Some(value),
+                    other => warn_unknown_parameter(other),
+                }
+            }
+        }
+        return Ok(spec);
+    }
+
+    // 2. `user[:password]@host[:port][#fingerprint]`
+    if let Some((userinfo, hostpart)) = raw.rsplit_once('@') {
+        let mut spec = TargetSpec::default();
+        let (user, password) = match userinfo.split_once(':') {
+            Some((user, password)) => (user, Some(password.to_string())),
+            None => (userinfo, None),
+        };
+        if !user.trim().is_empty() {
+            spec.username = Some(url_decode(user));
+        }
+        spec.password = password.map(|p| url_decode(&p));
+        parse_authority(hostpart, &mut spec)?;
+        return Ok(spec);
+    }
+
+    // 3. A bare word is a profile name saved in config.toml.
+    let looks_like_address = raw.contains(':')
+        || raw.contains('#')
+        || raw.starts_with('[')
+        || raw.eq_ignore_ascii_case("localhost")
+        || raw.chars().all(|c| c.is_ascii_digit() || c == '.');
+    let host_like = raw.parse::<std::net::IpAddr>().is_ok();
+    if !looks_like_address && !host_like {
+        let wanted = raw.to_ascii_lowercase();
+        let profile = cfg
+            .client
+            .hosts
+            .iter()
+            .find(|h| h.name.to_ascii_lowercase() == wanted)
+            .ok_or_else(|| {
+                let known: Vec<&str> = cfg.client.hosts.iter().map(|h| h.name.as_str()).collect();
+                if known.is_empty() {
+                    format!(
+                        "`{raw}` is not a saved host; either add it with \
+                         `remote-terminal fingerprint <host:port> --save {raw}` \
+                         or pass a target like user@host:port"
+                    )
+                } else {
+                    format!(
+                        "`{raw}` is not a saved host; known profiles: {} \
+                         (save a new one with `remote-terminal fingerprint <host:port> --save {raw}`)",
+                        known.join(", ")
+                    )
+                }
+            })?;
+        return Ok(TargetSpec {
+            host: Some(profile.host.clone()),
+            port: Some(profile.port),
+            tls: Some(true),
+            fingerprint: profile.fingerprint.clone(),
+            username: Some(profile.username.clone()),
+            ..TargetSpec::default()
+        });
+    }
+
+    // 4. `host[:port][#fingerprint]`
+    let mut spec = TargetSpec::default();
+    parse_authority(raw, &mut spec)?;
+    Ok(spec)
+}
+
+/// Splits `host[:port][#fingerprint]` (IPv6 hosts in brackets) into `spec`.
+fn parse_authority(raw: &str, spec: &mut TargetSpec) -> std::result::Result<(), String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("target has no host".to_string());
+    }
+    let (raw, fingerprint) = match raw.split_once('#') {
+        Some((raw, fp)) => (raw, Some(url_decode(fp))),
+        None => (raw, None),
+    };
+    if let Some(fp) = fingerprint {
+        if !fp.is_empty() {
+            spec.fingerprint = Some(fp);
+        }
+    }
+
+    let (host, port) = if let Some(rest) = raw.strip_prefix('[') {
+        // Bracketed IPv6 literal.
+        let (host, tail) = rest
+            .split_once(']')
+            .ok_or_else(|| format!("`{raw}` is missing the closing `]` of an IPv6 host"))?;
+        let port = match tail.strip_prefix(':') {
+            Some(port) if !port.is_empty() => Some(port),
+            _ => None,
+        };
+        (host.to_string(), port)
+    } else {
+        match raw.rsplit_once(':') {
+            Some((host, port)) if !host.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
+                (host.to_string(), Some(port))
+            }
+            _ => (raw.to_string(), None),
+        }
+    };
+    if host.is_empty() {
+        return Err("target has no host".to_string());
+    }
+    spec.host = Some(host);
+    if let Some(port) = port {
+        let port: u16 = port
+            .parse()
+            .map_err(|_| format!("`{port}` is not a valid port number"))?;
+        spec.port = Some(port);
+    }
+    Ok(())
+}
+
+fn url_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or("");
+            if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                out.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn warn_unknown_parameter(name: &str) {
+    tracing::warn!(parameter = %name, "ignoring an unknown target query parameter");
+}
+
 impl Endpoint {
-    /// Resolution order: environment → first config host → localhost default.
+    /// Compatibility shim: a resolution failure degrades to the local default.
     pub fn resolve(cfg: &Config) -> Endpoint {
+        match Self::resolve_with(cfg, None) {
+            Ok(endpoint) => endpoint,
+            Err(err) => {
+                tracing::warn!(error = %err, "falling back to the local default endpoint");
+                Endpoint {
+                    host: "127.0.0.1".to_string(),
+                    port: cfg.server.port,
+                    tls: true,
+                    fingerprint: None,
+                    username: "admin".to_string(),
+                    password: None,
+                    api_key: None,
+                }
+            }
+        }
+    }
+
+    /// Resolves the endpoint to connect to.
+    ///
+    /// Precedence, most specific first: the explicit `target` argument (or
+    /// `RT_TARGET`), then the individual `RT_*` variables, then the saved host
+    /// from `config.toml`, then `127.0.0.1` + `server.port`.
+    pub fn resolve_with(
+        cfg: &Config,
+        target: Option<&str>,
+    ) -> std::result::Result<Endpoint, String> {
         let client: &ClientConfig = &cfg.client;
         let saved = client
             .hosts
@@ -62,23 +325,35 @@ impl Endpoint {
             .find(|h| h.auto_connect)
             .or_else(|| client.hosts.first());
 
-        let mut host = env_first(&["RT_HOST", "REMOTE_TERMINAL_HOST"]);
-        let mut port = env_first(&["RT_PORT", "REMOTE_TERMINAL_PORT"]).and_then(|p| p.parse().ok());
+        let raw = target
+            .map(|t| t.to_string())
+            .or_else(|| env_first(&["RT_TARGET", "REMOTE_TERMINAL_TARGET"]));
+        let spec = match raw.as_deref() {
+            Some(raw) => parse_connection_target(raw, cfg)?,
+            None => TargetSpec::default(),
+        };
 
-        if host.is_none() {
-            if let Some(saved) = saved {
-                host = Some(saved.host.clone());
-                port = Some(saved.port);
-            }
-        }
+        let mut host = spec
+            .host
+            .clone()
+            .or_else(|| env_first(&["RT_HOST", "REMOTE_TERMINAL_HOST"]))
+            .or_else(|| saved.map(|s| s.host.clone()))
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        let mut port = spec
+            .port
+            .or_else(|| env_first(&["RT_PORT", "REMOTE_TERMINAL_PORT"]).and_then(|p| p.parse().ok()))
+            .or_else(|| saved.map(|s| s.port));
 
-        // `host:port` in RT_HOST wins over RT_PORT.
-        let mut host = host.unwrap_or_else(|| "127.0.0.1".to_string());
-        if let Some((h, p)) = host.rsplit_once(':') {
-            if !h.is_empty() && !h.ends_with(']') {
-                if let Ok(parsed) = p.parse::<u16>() {
-                    host = h.to_string();
-                    port = Some(parsed);
+        // `host:port` in RT_HOST wins over RT_PORT. Only the environment may
+        // pack a port into the host string; a parsed or saved host is already
+        // split, and an IPv6 literal such as `::1` must survive untouched.
+        if spec.host.is_none() {
+            if let Some((h, p)) = host.rsplit_once(':') {
+                if !h.is_empty() && !h.ends_with(']') {
+                    if let Ok(parsed) = p.parse::<u16>() {
+                        host = h.to_string();
+                        port = Some(parsed);
+                    }
                 }
             }
         }
@@ -92,35 +367,60 @@ impl Endpoint {
         let allow_plaintext = env_first(&["RT_ALLOW_PLAINTEXT", "REMOTE_TERMINAL_ALLOW_PLAINTEXT"])
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        let tls = if insecure && allow_plaintext {
-            tracing::warn!(
-                "RT_INSECURE=1: credentials will travel in plaintext; \
-                 only do this on a trusted point-to-point link"
-            );
-            false
-        } else {
-            if insecure {
+        let mut tls = spec.tls.unwrap_or(true);
+        if !tls {
+            if allow_plaintext {
                 tracing::warn!(
-                    "RT_INSECURE=1 ignored: plaintext also requires RT_ALLOW_PLAINTEXT=1"
+                    "plaintext transport requested: credentials will travel in the clear; \
+                     only do this on a trusted point-to-point link"
+                );
+            } else {
+                return Err(
+                    "a plaintext target needs RT_ALLOW_PLAINTEXT=1 as an explicit opt-in \
+                     (and prefer rt:// with a pinned fingerprint whenever you can)"
+                        .to_string(),
                 );
             }
-            true
-        };
+        } else if insecure {
+            if allow_plaintext {
+                tracing::warn!(
+                    "RT_INSECURE=1: credentials will travel in plaintext; \
+                     only do this on a trusted point-to-point link"
+                );
+                tls = false;
+            } else {
+                tracing::warn!("RT_INSECURE=1 ignored: plaintext also requires RT_ALLOW_PLAINTEXT=1");
+            }
+        }
 
-        let fingerprint = env_first(&["RT_FINGERPRINT", "REMOTE_TERMINAL_FINGERPRINT"])
-            .or_else(|| saved.and_then(|s| s.fingerprint.clone()));
+        let fingerprint = spec
+            .fingerprint
+            .clone()
+            .or_else(|| env_first(&["RT_FINGERPRINT", "REMOTE_TERMINAL_FINGERPRINT"]))
+            .or_else(|| saved.and_then(|s| s.fingerprint.clone()))
+            .map(|fp| fp.trim().to_string())
+            .filter(|fp| !fp.is_empty());
 
-        Endpoint {
+        Ok(Endpoint {
             host,
             port: port.unwrap_or(cfg.server.port),
             tls,
             fingerprint,
-            username: env_first(&["RT_USER", "REMOTE_TERMINAL_USER"])
+            username: spec
+                .username
+                .clone()
+                .or_else(|| env_first(&["RT_USER", "REMOTE_TERMINAL_USER"]))
                 .or_else(|| saved.map(|s| s.username.clone()))
                 .unwrap_or_else(|| "admin".to_string()),
-            password: env_first(&["RT_PASSWORD", "REMOTE_TERMINAL_PASSWORD"]),
-            api_key: env_first(&["RT_TOKEN", "REMOTE_TERMINAL_TOKEN"]),
-        }
+            password: spec
+                .password
+                .clone()
+                .or_else(|| env_first(&["RT_PASSWORD", "REMOTE_TERMINAL_PASSWORD"])),
+            api_key: spec
+                .token
+                .clone()
+                .or_else(|| env_first(&["RT_TOKEN", "REMOTE_TERMINAL_TOKEN"])),
+        })
     }
 
     pub fn target(&self) -> Target {
@@ -947,6 +1247,112 @@ mod tests {
         let next = unique_path(&dir, "a.txt");
         assert_eq!(next.file_name().unwrap(), "a (1).txt");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn profile_cfg() -> Config {
+        let mut cfg = Config::default();
+        cfg.server.port = 5000;
+        cfg.client.hosts.push(rt_core::config::HostConfig {
+            name: "final".into(),
+            host: "10.0.0.5".into(),
+            port: 6000,
+            fingerprint: Some("AB".repeat(32)),
+            username: "alice".into(),
+            last_scope: None,
+            last_connected: None,
+            auto_connect: false,
+        });
+        cfg
+    }
+
+    #[test]
+    fn a_bare_word_selects_the_saved_profile() {
+        let cfg = profile_cfg();
+        let ep = Endpoint::resolve_with(&cfg, Some("final")).expect("profile resolves");
+        assert_eq!(ep.host, "10.0.0.5");
+        assert_eq!(ep.port, 6000);
+        assert_eq!(ep.username, "alice");
+        assert!(ep.tls);
+        assert_eq!(ep.fingerprint.as_deref(), Some("AB".repeat(32).as_str()));
+
+        // Names are matched case-insensitively.
+        assert!(Endpoint::resolve_with(&cfg, Some("FINAL")).is_ok());
+    }
+
+    #[test]
+    fn an_unknown_profile_lists_the_known_ones() {
+        let cfg = profile_cfg();
+        let err = Endpoint::resolve_with(&cfg, Some("nope")).expect_err("unknown profile");
+        assert!(err.contains("not a saved host"), "{err}");
+        assert!(
+            err.contains("final"),
+            "the message should name the known profile: {err}"
+        );
+    }
+
+    #[test]
+    fn inline_targets_carry_user_port_and_fingerprint() {
+        let cfg = Config::default();
+
+        let ep = Endpoint::resolve_with(&cfg, Some("bob@192.168.1.9:47000#AABBCC"))
+            .expect("user@host:port");
+        assert_eq!(ep.host, "192.168.1.9");
+        assert_eq!(ep.port, 47000);
+        assert_eq!(ep.username, "bob");
+        assert_eq!(ep.fingerprint.as_deref(), Some("AABBCC"));
+
+        // A bracketed IPv6 literal keeps its colons.
+        let ep = Endpoint::resolve_with(&cfg, Some("[::1]:46666")).expect("ipv6");
+        assert_eq!(ep.host, "::1");
+        assert_eq!(ep.port, 46666);
+
+        // A bare host keeps the server port.
+        let ep = Endpoint::resolve_with(&cfg, Some("10.1.2.3")).expect("host only");
+        assert_eq!(ep.host, "10.1.2.3");
+        assert_eq!(ep.port, cfg.server.port);
+    }
+
+    #[test]
+    fn url_targets_decode_credentials_and_queries() {
+        let cfg = Config::default();
+        let ep = Endpoint::resolve_with(
+            &cfg,
+            Some("rt://alice:s%40cret@10.0.0.5:46666?fp=AA%3ABB&token=rt_xyz"),
+        )
+        .expect("rt url");
+        assert!(ep.tls);
+        assert_eq!(ep.username, "alice");
+        assert_eq!(ep.password.as_deref(), Some("s@cret"));
+        assert_eq!(ep.fingerprint.as_deref(), Some("AA:BB"));
+        assert_eq!(ep.api_key.as_deref(), Some("rt_xyz"));
+
+        // An unknown scheme is a clear error rather than a silent fallback.
+        let err = Endpoint::resolve_with(&cfg, Some("ftp://10.0.0.5")).expect_err("scheme");
+        assert!(err.contains("unsupported scheme"), "{err}");
+    }
+
+    #[test]
+    fn plaintext_targets_need_an_explicit_opt_in() {
+        if env_first(&["RT_ALLOW_PLAINTEXT", "REMOTE_TERMINAL_ALLOW_PLAINTEXT"]).is_some() {
+            // The environment already opts in; the refusal path is covered
+            // below without racing on process-wide variables.
+            return;
+        }
+        let cfg = Config::default();
+        let err = Endpoint::resolve_with(&cfg, Some("http://10.0.0.5:46666"))
+            .expect_err("plaintext needs RT_ALLOW_PLAINTEXT=1");
+        assert!(err.contains("RT_ALLOW_PLAINTEXT"), "{err}");
+    }
+
+    #[test]
+    fn an_out_of_range_port_is_reported() {
+        let cfg = Config::default();
+        // `host:abc` is a host name with a colon, not a port.
+        let ep = Endpoint::resolve_with(&cfg, Some("myhost:abc")).expect("host with colon");
+        assert_eq!(ep.host, "myhost:abc");
+        // A numeric port outside 0..=65535 is rejected outright.
+        let err = Endpoint::resolve_with(&cfg, Some("10.0.0.5:99999")).expect_err("port range");
+        assert!(err.contains("not a valid port"), "{err}");
     }
 
     #[test]

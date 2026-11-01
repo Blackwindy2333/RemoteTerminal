@@ -283,34 +283,38 @@ Destructive tools (`rt_exec`, `rt_fs_write`, `rt_fs_delete`, `rt_fs_rename`,
 `rt_fs_copy`, `rt_fs_upload`) additionally require an operator lease; see
 `remote-terminal approve --list`.
 
-Configuration is entirely through environment variables (no secrets in files):
+Configuration is one optional target argument plus one secret. The target may be
+a saved profile name, an inline `user:password@host:port#fingerprint`, a
+`rt://…` URL, or plain `host:port`; omit it to use the profile flagged
+`auto_connect` (or the first saved host).
+
+```powershell
+remote-terminal.exe fingerprint 192.168.1.10:46666 --save office --username alice
+remote-terminal.exe mcp-config office        # ready-to-paste registration
+remote-terminal.exe mcp office               # what the harness runs
+```
 
 | Variable | Meaning |
 | --- | --- |
-| `RT_HOST` | `host` or `host:port` |
-| `RT_PORT` | port when `RT_HOST` has none |
-| `RT_USER` / `RT_PASSWORD` | password login |
+| `RT_PASSWORD` | password for the saved profile's user |
 | `RT_TOKEN` | API key, instead of a password |
-| `RT_FINGERPRINT` | pinned certificate fingerprint |
-| `RT_INSECURE` | `1` to allow plaintext HTTP |
+| `RT_TARGET` | override the target (`name`, `user:pass@host:port#fp`, `rt://…`) |
+| `RT_HOST` / `RT_PORT` / `RT_USER` / `RT_FINGERPRINT` | legacy per-field overrides, still honoured |
+| `RT_INSECURE` + `RT_ALLOW_PLAINTEXT` | both must be `1` to allow plaintext HTTP |
 | `RT_DOWNLOAD_DIR` / `RT_CAPTURE_DIR` | where downloads / captures land |
 
-DSH (`dsh-mcp.json`):
+DSH (`dsh-mcp.json`) — `mcp-config <profile>` prints exactly this:
 
 ```json
 {
   "version": 1,
   "servers": {
-    "remote-terminal": {
+    "office": {
       "transport": "stdio",
       "enabled": true,
       "command": "D:\\Tools\\RemoteTerminal\\remote-terminal.exe",
-      "args": ["mcp"],
-      "env": {
-        "RT_HOST": "192.168.1.10:46666",
-        "RT_PASSWORD": "……",
-        "RT_FINGERPRINT": "AB:CD:…"
-      }
+      "args": ["--config", "C:\\Users\\me\\.config\\RemoteTerminal\\config.toml", "mcp", "office"],
+      "env": { "RT_PASSWORD": "……" }
     }
   }
 }
