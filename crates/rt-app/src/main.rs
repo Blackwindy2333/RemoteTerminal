@@ -194,6 +194,30 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Command::RotateCert => {
+            let boot =
+                rt_app::bootstrap::bootstrap(config_path.as_deref(), cli.verbose, true)?;
+            let server = &boot.config().server;
+            if server.cert_path.is_some() || server.key_path.is_some() {
+                bail!(
+                    "the configuration points at a custom certificate (server.cert_path / \
+                     server.key_path); rotate that pair with your own tooling instead"
+                );
+            }
+            let hostnames = tls_hostnames(&server.bind);
+            let material =
+                rt_core::crypto::rotate_self_signed_tls(&boot.paths.tls_dir, &hostnames)
+                    .context("cannot rotate the self-signed certificate")?;
+            println!("Rotated the self-signed certificate.");
+            println!("  directory  : {}", boot.paths.tls_dir.display());
+            println!("  fingerprint: {}", rt_core::crypto::format_fingerprint(&material.fingerprint));
+            println!("  subjects   : {}", hostnames.join(", "));
+            println!();
+            println!(
+                "Restart the server, then re-pin every client: `remote-terminal fingerprint <host:port>`"
+            );
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Info { target } => {
             let runtime = rt_app::bootstrap::runtime()?;
             let code = runtime.block_on(client_info(config_path, target))?;
@@ -221,6 +245,27 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::from(code as u8))
         }
     }
+}
+
+/// Subject alternative names to bake into a rotated self-signed certificate.
+///
+/// Mirrors the list the server uses when it generates one on first start, so a
+/// rotation produces a certificate with the same identities.
+fn tls_hostnames(bind: &str) -> Vec<String> {
+    let mut names = vec!["localhost".to_string(), "127.0.0.1".to_string(), "::1".to_string()];
+    let host = rt_core::util::hostname();
+    if !host.is_empty() && !names.iter().any(|name| name == &host) {
+        names.push(host);
+    }
+    let trimmed = bind.trim_start_matches('[').trim_end_matches(']');
+    if !trimmed.is_empty()
+        && trimmed != "0.0.0.0"
+        && trimmed != "::"
+        && !names.iter().any(|name| name == trimmed)
+    {
+        names.push(trimmed.to_string());
+    }
+    names
 }
 
 /// Starts the API server and blocks until Ctrl+C.
@@ -322,7 +367,10 @@ fn target_from(boot: &rt_app::Bootstrapped, args: &TargetArgs) -> rt_client::Tar
     target
 }
 
-fn credentials(boot: &rt_app::Bootstrapped, args: &TargetArgs) -> (String, Option<String>, Option<String>) {
+fn credentials(
+    boot: &rt_app::Bootstrapped,
+    args: &TargetArgs,
+) -> anyhow::Result<(String, Option<String>, Option<String>)> {
     let saved = boot
         .config()
         .client
@@ -341,12 +389,38 @@ fn credentials(boot: &rt_app::Bootstrapped, args: &TargetArgs) -> (String, Optio
         .clone()
         .or_else(|| std::env::var("RT_TOKEN").ok())
         .filter(|t| !t.is_empty());
-    let password = args
-        .password
-        .clone()
+    // S-38: a password on the command line is visible in the process list and
+    // in shell history. `--password-stdin` reads it from a pipe instead, and
+    // takes precedence so a stale `--password` cannot shadow it.
+    let stdin_password = if args.password_stdin {
+        Some(read_secret_from_stdin()?)
+    } else {
+        None
+    };
+    let password = stdin_password
+        .or_else(|| args.password.clone())
         .or_else(|| std::env::var("RT_PASSWORD").ok())
         .filter(|p| !p.is_empty());
-    (user, token, password)
+    Ok((user, token, password))
+}
+
+/// Reads one line from stdin without echoing it beyond what the terminal does.
+fn read_secret_from_stdin() -> anyhow::Result<String> {
+    use std::io::BufRead;
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        eprintln!("password: ");
+    }
+    let mut line = String::new();
+    stdin
+        .lock()
+        .read_line(&mut line)
+        .context("cannot read the password from stdin")?;
+    let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
+    if trimmed.is_empty() {
+        bail!("--password-stdin was given but stdin had no password");
+    }
+    Ok(trimmed)
 }
 
 async fn connect(
@@ -355,7 +429,7 @@ async fn connect(
 ) -> anyhow::Result<rt_client::RemoteClient> {
     let boot = rt_app::bootstrap::bootstrap(Some(config), false, false)?;
     let target = target_from(&boot, args);
-    let (user, token, password) = credentials(&boot, args);
+    let (user, token, password) = credentials(&boot, args)?;
     let client = rt_client::RemoteClient::new(target)?;
 
     // S-06: never hand a password to an unverified peer. When the certificate is

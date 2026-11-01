@@ -83,6 +83,13 @@ pub enum Command {
         timeout: u64,
     },
 
+    /// Regenerate the self-signed TLS certificate (S-40).
+    ///
+    /// The previous pair is kept next to the new one as `*.old`. Every pinned
+    /// client has to re-run `fingerprint` and update its pin afterwards.
+    #[command(name = "rotate-cert")]
+    RotateCert,
+
     /// Grant, list or revoke time-boxed leases for destructive MCP tools.
     ///
     /// The MCP bridge refuses `rt_exec`, `rt_fs_write`, `rt_fs_delete`,
@@ -140,8 +147,14 @@ pub struct TargetArgs {
     #[arg(long)]
     pub user: Option<String>,
     /// Password for password login.
+    ///
+    /// Visible in the process list and in shell history; prefer
+    /// `--password-stdin` or the `RT_PASSWORD` environment variable (S-38).
     #[arg(long)]
     pub password: Option<String>,
+    /// Read the password from standard input instead of the command line.
+    #[arg(long)]
+    pub password_stdin: bool,
     /// Pinned certificate fingerprint (recommended).
     #[arg(long)]
     pub fingerprint: Option<String>,
@@ -168,6 +181,7 @@ impl Command {
             Command::GenKey { .. } => "gen-key",
             Command::Fingerprint { .. } => "fingerprint",
             Command::Approve { .. } => "approve",
+            Command::RotateCert => "rotate-cert",
             Command::Exec { .. } => "exec",
             Command::Info { .. } => "info",
         }

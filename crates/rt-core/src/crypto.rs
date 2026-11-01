@@ -258,6 +258,27 @@ pub fn ensure_self_signed_tls(dir: &Path, hostnames: &[String]) -> Result<TlsMat
     Ok(material)
 }
 
+/// Regenerate the self-signed pair, keeping the previous files as
+/// `<name>.<timestamp>.old` (S-40).
+///
+/// Rotation invalidates every pinned client: they must re-run
+/// `remote-terminal fingerprint <host>` and update their pin, so this is a
+/// deliberate operator action rather than something that happens on its own.
+pub fn rotate_self_signed_tls(dir: &Path, hostnames: &[String]) -> Result<TlsMaterial> {
+    std::fs::create_dir_all(dir).map_err(|e| RtError::io(dir.to_path_buf(), e))?;
+    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    for name in [CERT_FILE, KEY_FILE, FP_FILE] {
+        let path = dir.join(name);
+        if path.exists() {
+            let backup = dir.join(format!("{name}.{stamp}.old"));
+            std::fs::rename(&path, &backup).map_err(|e| RtError::io(path.clone(), e))?;
+            crate::acl::restrict_or_warn(&backup);
+        }
+    }
+    tracing::info!(target: "rt_core::crypto", dir = %dir.display(), "rotated the self-signed TLS pair");
+    ensure_self_signed_tls(dir, hostnames)
+}
+
 fn generate_self_signed(
     _dir: &Path,
     cert_path: &Path,

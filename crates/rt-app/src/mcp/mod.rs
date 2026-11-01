@@ -27,6 +27,12 @@ use tools::{Bridge, Endpoint};
 
 const SERVER_NAME: &str = "remote-terminal";
 const SUPPORTED_PROTOCOLS: &[&str] = &["2024-11-05", "2024-10-07", "2025-03-26", "2025-06-18"];
+/// Largest accepted request line. A bigger one is refused instead of buffered
+/// (S-37): the bridge must not turn a hostile agent into an OOM.
+const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
+/// Error text handed back to the model is clipped to this many characters
+/// (S-36) so a chatty server error cannot flood the conversation.
+const MAX_ERROR_CHARS: usize = 2000;
 
 /// Runs the stdio bridge until stdin closes. Returns a process exit code.
 pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<i32> {
@@ -87,6 +93,17 @@ pub async fn run(config_path: Option<PathBuf>) -> anyhow::Result<i32> {
     while let Some(line) = reader.next_line().await? {
         let line = line.trim();
         if line.is_empty() {
+            continue;
+        }
+        // S-37: refuse oversized requests rather than parsing them.
+        if line.len() > MAX_INPUT_BYTES {
+            tracing::warn!(bytes = line.len(), "refusing an oversized MCP request line");
+            let reply = error_reply(
+                Value::Null,
+                -32600,
+                &format!("request too large: {} bytes (limit {MAX_INPUT_BYTES})", line.len()),
+            );
+            write_reply(&mut writer, &reply).await?;
             continue;
         }
 
@@ -234,11 +251,33 @@ impl McpState {
 }
 
 fn tool_content(payload: &Value, is_error: bool) -> Value {
-    let text = serde_json::to_string_pretty(payload)
-        .unwrap_or_else(|_| payload.to_string());
+    let payload = if is_error {
+        clip_error_text(payload)
+    } else {
+        payload.clone()
+    };
+    let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
     json!({
         "content": [{ "type": "text", "text": text }],
         "isError": is_error
+    })
+}
+
+/// Clips an `{"error": "..."}` payload to [`MAX_ERROR_CHARS`] (S-36).
+fn clip_error_text(payload: &Value) -> Value {
+    let Some(message) = payload.get("error").and_then(|e| e.as_str()) else {
+        return payload.clone();
+    };
+    if message.chars().count() <= MAX_ERROR_CHARS {
+        return payload.clone();
+    }
+    let clipped: String = message.chars().take(MAX_ERROR_CHARS).collect();
+    json!({
+        "error": clipped,
+        "truncated": true,
+        "note": format!(
+            "the error text was clipped to {MAX_ERROR_CHARS} characters"
+        )
     })
 }
 
