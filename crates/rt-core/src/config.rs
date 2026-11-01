@@ -18,6 +18,9 @@ use crate::{crypto, error::Result, error::RtError};
 pub const CONFIG_FILE_NAME: &str = "config.toml";
 pub const CONFIG_VERSION: u32 = 1;
 pub const ENV_CONFIG_PATH: &str = "REMOTE_TERMINAL_CONFIG";
+/// How many rotated `audit.jsonl.<stamp>` files are kept by default.
+/// The audit trail rotates at 16 MiB, so this bounds the audit footprint.
+pub const DEFAULT_AUDIT_MAX_FILES: usize = 10;
 
 // ---------------------------------------------------------------------------
 // Root
@@ -149,6 +152,13 @@ pub struct LoggingConfig {
     /// Security audit trail (separate file, always JSON lines).
     pub audit: bool,
     pub audit_file: PathBuf,
+    /// Rotated audit files (`audit.jsonl.<stamp>`) to keep; older ones are
+    /// deleted after every rotation. `0` is treated as `1`.
+    pub audit_max_files: usize,
+    /// Treat a failed audit write as an error instead of a log line: callers
+    /// using the checked API answer `503` rather than acting unrecorded.
+    /// Off by default so a full disk does not take the server down (S-25).
+    pub audit_fail_closed: bool,
     /// How many lines the GUI log viewer keeps in memory.
     pub ui_buffer_lines: usize,
 }
@@ -165,6 +175,8 @@ impl Default for LoggingConfig {
             json: false,
             audit: true,
             audit_file: PathBuf::from("logs/audit.jsonl"),
+            audit_max_files: DEFAULT_AUDIT_MAX_FILES,
+            audit_fail_closed: false,
             ui_buffer_lines: 2000,
         }
     }
@@ -201,7 +213,9 @@ pub struct ServerConfig {
     pub max_sessions: usize,
     pub login_max_attempts: u32,
     pub login_lockout_secs: u64,
-    /// Max requests per minute per client IP (0 = unlimited).
+    /// Max requests per minute per client IP. Must be >= 1 (60 or more is
+    /// recommended); `0` would silently disable rate limiting and is rejected
+    /// by [`Config::validate`] (S-33).
     pub rate_limit_per_min: u32,
     /// Optional IP allow-list (`192.168.1.`, `10.0.0.5`, `::1`). Empty = any.
     pub ip_allowlist: Vec<String>,
@@ -410,7 +424,13 @@ pub struct ResolvedPaths {
 impl ResolvedPaths {
     pub fn resolve(config: &Config, base_dir: &Path) -> Self {
         let base = base_dir.to_path_buf();
-        let join = |p: &PathBuf| if p.is_absolute() { p.clone() } else { base.join(p) };
+        let join = |p: &PathBuf| {
+            if p.is_absolute() {
+                p.clone()
+            } else {
+                base.join(p)
+            }
+        };
         let data_dir = base.join("data");
         let logs_dir = join(&config.logging.dir);
         let audit_file = join(&config.logging.audit_file);
@@ -438,6 +458,12 @@ impl ResolvedPaths {
         ] {
             std::fs::create_dir_all(dir).map_err(|e| RtError::io(dir.clone(), e))?;
         }
+        // S-15: the data dir holds `instance.lock` (and the sessions/audit
+        // state) and the TLS dir holds the private key — both must belong to
+        // the account running us, not to every local user who can read the
+        // install directory. Best effort: a failure only warns.
+        crate::acl::restrict_or_warn(&self.data_dir);
+        crate::acl::restrict_or_warn(&self.tls_dir);
         Ok(())
     }
 }
@@ -565,6 +591,10 @@ pub fn load_or_create(explicit_path: Option<&Path>) -> Result<LoadedConfig> {
         config
             .save_with_header(&path)
             .map_err(|e| RtError::Config(format!("failed to write default config: {e}")))?;
+        // S-15: a freshly generated config holds password hashes and API-key
+        // digests. Even when the exe was copied from somewhere else, the file
+        // we just wrote must not inherit a world-readable ACL.
+        crate::acl::restrict_or_warn(&path);
         warnings.push(format!("created default config at {}", path.display()));
         Ok(LoadedConfig {
             config,
@@ -598,12 +628,22 @@ impl Config {
 #        {app}.exe genkey --scope workspace
 #  * TLS is mandatory unless the server binds to loopback (or you opt out
 #    with `allow_insecure_lan`, which is logged as a warning).
+#  * `server.rate_limit_per_min` must be at least 1 (60 or more is
+#    recommended). 0 does NOT mean 'unlimited': it is rejected as invalid
+#    instead of silently switching the brute-force protection off.
+#  * `logging.audit_max_files` bounds how many rotated audit files
+#    (`audit.jsonl.<stamp>`, rotated at 16 MiB) are kept; older ones are
+#    deleted (default {audit_max_files}).
+#  * `logging.audit_fail_closed = true` makes a failed audit write an error
+#    (HTTP 503) instead of a warning, so no action can happen unaudited.
+#    The default is false: a full disk must not take the server down.
 #
 # Paths are relative to the directory that contains this file.
 # =====================================================================
 
 ",
-            app = rt_protocol::APP_NAME
+            app = rt_protocol::APP_NAME,
+            audit_max_files = DEFAULT_AUDIT_MAX_FILES
         );
         Ok(format!("{header}{body}"))
     }
@@ -626,6 +666,19 @@ impl Config {
 
         if self.server.port == 0 {
             report.errors.push("server.port must be 1-65535".into());
+        }
+        // S-33: `rate_limit_per_min = 0` used to mean "no limit at all", which
+        // silently turns the brute-force protection off. Treat it as invalid.
+        if self.server.rate_limit_per_min == 0 {
+            report.errors.push(
+                "server.rate_limit_per_min must be at least 1; 0 would disable rate limiting entirely (60 or more is recommended)"
+                    .into(),
+            );
+        } else if self.server.rate_limit_per_min < 10 {
+            report.warnings.push(format!(
+                "server.rate_limit_per_min = {} is very low; 60 or more is recommended",
+                self.server.rate_limit_per_min
+            ));
         }
         if self.server.bind.trim().is_empty() {
             report.errors.push("server.bind must not be empty".into());
@@ -684,7 +737,9 @@ impl Config {
         }
         if let Some(name) = &self.server.name {
             if name.trim().is_empty() {
-                report.warnings.push("server.name is empty; using hostname".into());
+                report
+                    .warnings
+                    .push("server.name is empty; using hostname".into());
             }
         }
         report
@@ -705,7 +760,12 @@ impl Config {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
-            .unwrap_or_else(|| hostname::get().ok().and_then(|h| h.into_string().ok()).unwrap_or_else(|| "windows".into()))
+            .unwrap_or_else(|| {
+                hostname::get()
+                    .ok()
+                    .and_then(|h| h.into_string().ok())
+                    .unwrap_or_else(|| "windows".into())
+            })
     }
 
     /// Find (or create) a host entry by host:port.
@@ -747,32 +807,84 @@ impl ValidationReport {
 }
 
 /// Atomic file write with backup. Used for config and TLS material.
+///
+/// S-34: the temporary file is created with `create_new(true)` under a random
+/// name next to the destination, so an attacker who pre-plants that path (or a
+/// symlink/junction at it) can never be followed: the write fails and we retry
+/// with a fresh name instead of truncating whatever was there.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomic_with(path, bytes, |attempt| {
+        format!(".{}.{}.tmp", crypto::random_token(12), attempt)
+    })
+}
+
+/// Retries on a name collision: first attempt plus three more names.
+const WRITE_ATOMIC_ATTEMPTS: usize = 4;
+
+/// [`write_atomic`] with an injectable temp-name generator (test seam).
+fn write_atomic_with(
+    path: &Path,
+    bytes: &[u8],
+    mut temp_name: impl FnMut(usize) -> String,
+) -> Result<()> {
     use std::io::Write;
 
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent).map_err(|e| RtError::io(parent.to_path_buf(), e))?;
-    let tmp = path.with_extension(format!(
-        "{}.tmp",
-        path.extension().and_then(|e| e.to_str()).unwrap_or("tmp")
-    ));
 
-    {
-        let mut file = std::fs::File::create(&tmp).map_err(|e| RtError::io(tmp.clone(), e))?;
-        file.write_all(bytes).map_err(|e| RtError::io(tmp.clone(), e))?;
-        file.sync_all().map_err(|e| RtError::io(tmp.clone(), e))?;
+    let mut created: Option<(PathBuf, std::fs::File)> = None;
+    let mut collision: Option<std::io::Error> = None;
+    for attempt in 0..WRITE_ATOMIC_ATTEMPTS {
+        let candidate = parent.join(temp_name(attempt));
+        match std::fs::OpenOptions::new()
+            // `create_new` = O_CREAT|O_EXCL: never reuse, never follow a link.
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                created = Some((candidate, file));
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                collision = Some(err);
+            }
+            Err(err) => return Err(RtError::io(candidate, err)),
+        }
+    }
+    let Some((tmp, mut file)) = created else {
+        let err = collision.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "every temporary file name was taken",
+            )
+        });
+        return Err(RtError::io(path.to_path_buf(), err));
+    };
+
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(err) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(RtError::io(tmp, err));
     }
 
     if path.exists() {
         let bak = path.with_extension("toml.bak");
         // Best effort; a missing backup must not block a save.
-        let _ = std::fs::copy(path, &bak);
+        if std::fs::copy(path, &bak).is_ok() {
+            // S-15: the backup carries the same secrets as the config itself.
+            crate::acl::restrict_or_warn(&bak);
+        }
     }
 
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         RtError::io(path.to_path_buf(), e)
     })?;
+    // S-15: the config holds password hashes and key digests; make it owner
+    // only. Best effort so a hardening failure never blocks a save.
+    crate::acl::restrict_or_warn(path);
     Ok(())
 }
 
@@ -830,5 +942,138 @@ mod tests {
         assert_eq!(paths.logs_dir, Path::new("C:/app/logs"));
         assert_eq!(paths.workspace_root, Path::new("C:/app/workspace"));
         assert_eq!(paths.config_file, Path::new("C:/app/config.toml"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_rate_limit() {
+        // S-33: 0 used to mean "unlimited", i.e. silently disabled protection.
+        let mut cfg = Config::default();
+        cfg.server.rate_limit_per_min = 0;
+        let report = cfg.validate();
+        assert!(!report.is_ok());
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("rate_limit_per_min")),
+            "expected a rate_limit error, got {:?}",
+            report.errors
+        );
+
+        cfg.server.rate_limit_per_min = 60;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn audit_defaults_are_bounded_and_fail_open() {
+        let cfg = Config::default();
+        assert_eq!(cfg.logging.audit_max_files, DEFAULT_AUDIT_MAX_FILES);
+        assert_eq!(cfg.logging.audit_max_files, 10);
+        assert!(!cfg.logging.audit_fail_closed);
+
+        // The knobs survive a round-trip and stay optional in older files.
+        let text = cfg.to_toml_with_header().expect("serialize");
+        assert!(text.contains("audit_max_files = 10"));
+        assert!(text.contains("audit_fail_closed = false"));
+        let parsed: Config = toml::from_str(&text).expect("parse");
+        assert_eq!(parsed.logging.audit_max_files, 10);
+        let minimal: Config = toml::from_str("[logging]\nlevel = \"debug\"\n").expect("parse");
+        assert_eq!(minimal.logging.audit_max_files, DEFAULT_AUDIT_MAX_FILES);
+        assert!(!minimal.logging.audit_fail_closed);
+    }
+
+    #[test]
+    fn generated_header_documents_the_security_knobs() {
+        let text = Config::default().to_toml_with_header().expect("serialize");
+        assert!(text.contains("rate_limit_per_min"));
+        assert!(text.contains("audit_max_files"));
+        assert!(text.contains("audit_fail_closed"));
+    }
+
+    #[test]
+    fn write_atomic_survives_a_preplanted_temp_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, b"old").expect("seed config");
+        // The attacker planted the exact name our first attempt would use.
+        let planted = dir.path().join("planted.tmp");
+        std::fs::write(&planted, b"attacker").expect("seed planted");
+
+        let attempts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = attempts.clone();
+        write_atomic_with(&path, b"new", move |attempt| {
+            seen.lock().expect("lock").push(attempt);
+            if attempt == 0 {
+                "planted.tmp".to_string()
+            } else {
+                format!("retry-{attempt}.tmp")
+            }
+        })
+        .expect("a taken temp name must not fail the write");
+
+        assert_eq!(*attempts.lock().expect("lock"), vec![0, 1]);
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "new");
+        // The planted file is never written through or truncated.
+        assert_eq!(std::fs::read_to_string(&planted).expect("read"), "attacker");
+        // The previous config was backed up.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("config.toml.bak")).expect("bak"),
+            "old"
+        );
+    }
+
+    #[test]
+    fn write_atomic_leaves_no_temporary_files_behind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        write_atomic(&path, b"one").expect("first write");
+        write_atomic(&path, b"two").expect("second write");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "two");
+
+        let temps: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(temps.is_empty(), "temporary files leaked: {temps:?}");
+    }
+
+    #[test]
+    fn write_atomic_creates_missing_parent_directories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nested/deeper/config.toml");
+        write_atomic(&path, b"x").expect("write");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "x");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn save_atomic_hardens_the_file_but_the_owner_can_still_read_it() {
+        // S-15: restricting the DACL to the current user must not lock the
+        // writer out. The owner keeps full control, so the round-trip works.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let mut cfg = Config::default();
+        cfg.server.rate_limit_per_min = 120;
+        cfg.logging.audit_fail_closed = true;
+
+        cfg.save_atomic(&path).expect("save");
+        let text = std::fs::read_to_string(&path).expect("the owner must read it back");
+        let parsed: Config = toml::from_str(&text).expect("parse");
+        assert_eq!(parsed.server.rate_limit_per_min, 120);
+        assert!(parsed.logging.audit_fail_closed);
+
+        // A second save overwrites through the hardened path (and backfills the
+        // backup), which must also stay readable for the owner.
+        cfg.server.rate_limit_per_min = 90;
+        cfg.save_atomic(&path).expect("overwrite");
+        let text = std::fs::read_to_string(&path).expect("read after overwrite");
+        let parsed: Config = toml::from_str(&text).expect("parse");
+        assert_eq!(parsed.server.rate_limit_per_min, 90);
+        let bak = path.with_extension("toml.bak");
+        if bak.exists() {
+            std::fs::read_to_string(&bak).expect("the backup must stay readable");
+        }
     }
 }

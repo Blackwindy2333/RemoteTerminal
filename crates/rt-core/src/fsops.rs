@@ -1027,26 +1027,42 @@ fn copy_file(
         verify_final_path(guard, &actual, to_label)?;
     }
     let mut buf = vec![0u8; COPY_CHUNK];
-    loop {
-        let read = source.read(&mut buf).map_err(|e| io_err(from, e))?;
-        if read == 0 {
-            break;
+    let mut written = 0u64;
+    let mut next_space_check = SPACE_RECHECK_BYTES;
+    // A copy that runs the destination volume dry halfway leaves a file that
+    // looks complete but is not, so the partial destination is removed.
+    let outcome = (|| -> Result<()> {
+        loop {
+            let read = source.read(&mut buf).map_err(|e| io_err(from, e))?;
+            if read == 0 {
+                break;
+            }
+            state.bytes += read as u64;
+            if state.bytes > state.caps.max_bytes {
+                return Err(RtError::PayloadTooLarge(format!(
+                    "copy would move more than {} bytes in one request",
+                    state.caps.max_bytes
+                )));
+            }
+            if let Some(hasher) = hasher.as_deref_mut() {
+                hasher.update(&buf[..read]);
+            }
+            target
+                .write_all(&buf[..read])
+                .map_err(|e| io_err(to, e))?;
+            written += read as u64;
+            if written >= next_space_check {
+                next_space_check = written + SPACE_RECHECK_BYTES;
+                ensure_capacity(to, None, to_label)?;
+            }
         }
-        state.bytes += read as u64;
-        if state.bytes > state.caps.max_bytes {
-            return Err(RtError::PayloadTooLarge(format!(
-                "copy would move more than {} bytes in one request",
-                state.caps.max_bytes
-            )));
-        }
-        if let Some(hasher) = hasher.as_deref_mut() {
-            hasher.update(&buf[..read]);
-        }
-        target
-            .write_all(&buf[..read])
-            .map_err(|e| io_err(to, e))?;
+        target.sync_all().map_err(|e| io_err(to, e))
+    })();
+    if let Err(err) = outcome {
+        drop(target);
+        let _ = std::fs::remove_file(to);
+        return Err(err);
     }
-    target.sync_all().map_err(|e| io_err(to, e))?;
     Ok(())
 }
 
