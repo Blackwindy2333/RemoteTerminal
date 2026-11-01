@@ -228,6 +228,16 @@ message per line) and exposes 18 tools:
 `rt_fs_upload`, `rt_sysinfo`, `rt_processes`, `rt_screens`, `rt_windows`,
 `rt_capture`.
 
+`rt_capture` takes `target` = `primary` (default) / `all` / `foreground` /
+`screen:<id>` / `window:<id>`, `format` = `png|jpeg`, optional `quality`,
+`max_width`, `local_path` and `inline`. The image is written under
+`RT_CAPTURE_DIR` (default: current directory) and the resolved path is returned
+as `local_path`.
+
+Destructive tools (`rt_exec`, `rt_fs_write`, `rt_fs_delete`, `rt_fs_rename`,
+`rt_fs_copy`, `rt_fs_upload`) additionally require an operator lease; see
+`remote-terminal approve --list`.
+
 Configuration is entirely through environment variables (no secrets in files):
 
 | Variable | Meaning |
