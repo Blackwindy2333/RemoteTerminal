@@ -353,7 +353,15 @@ pub fn spawn_capture_stream(
                             id: Some(stream),
                             error,
                         }) if stream == id => {
-                            reason = Some(format!("{}: {}", error.code.as_str(), error.message));
+                            // Some server messages already carry the code as a
+                            // prefix (`forbidden: ...`); do not repeat it.
+                            let code = error.code.as_str();
+                            let prefix = format!("{code}: ");
+                            reason = Some(if error.message.starts_with(&prefix) {
+                                error.message.clone()
+                            } else {
+                                format!("{code}: {}", error.message)
+                            });
                             break;
                         }
                         Ok(_) => {}

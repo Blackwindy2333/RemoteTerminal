@@ -671,16 +671,20 @@ impl RemoteClient {
         }
 
         let previous = read_resume_meta(&meta_path).await;
+        let existing_partial = file_len(&part).await;
         let resumable = previous.as_ref().is_some_and(|meta| {
             meta.remote_path == remote_path
                 && meta.total_size == total_size
                 && meta.modified_ms == modified_ms
         });
         let mut resumed_from = if resumable {
-            file_len(&part).await.min(total_size)
+            existing_partial.min(total_size)
         } else {
             0
         };
+        // A partial that cannot be trusted is discarded, which is reported to
+        // the caller so a UI can explain why the progress bar went back to zero.
+        let mut restarted = !resumable && existing_partial > 0;
         if !resumable {
             let _ = tokio::fs::remove_file(&part).await;
         }
@@ -695,7 +699,6 @@ impl RemoteClient {
         )
         .await?;
 
-        let mut restarted = false;
         let mut attempts: u32 = 0;
         loop {
             let offset = file_len(&part).await;
