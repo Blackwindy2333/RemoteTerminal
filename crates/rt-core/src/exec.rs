@@ -24,7 +24,8 @@
 //!   whole process tree dies with the run even when a grandchild detaches from
 //!   the direct child; `taskkill /T /F` remains as the fallback when the OS
 //!   refuses the job, and it is always invoked through its absolute system
-//!   path so a poisoned `PATH` cannot intercept the teardown.
+//!   path (resolved with `GetSystemDirectoryW`) so neither a poisoned `PATH` nor
+//!   a rewritten `%SystemRoot%` can intercept the teardown.
 //! * Standard input is decoded in bounded slices and written from a dedicated
 //!   thread, so a child that never reads can be killed by the deadline instead
 //!   of parking the collector inside a blocking write.
@@ -905,11 +906,18 @@ fn kill_tree_by_pid(pid: u32) {
 ///
 /// A bare `taskkill` is looked up in `PATH`, where a writable directory (or a
 /// planted `taskkill.exe`) can intercept the teardown of the process tree. The
-/// system copy is therefore addressed through `%SystemRoot%`, defaulting to
-/// `C:\Windows`; only when that file is missing does the bare name remain as a
-/// last resort.
+/// kernel is therefore asked for the real system directory first, so neither
+/// `PATH` nor an inherited `%SystemRoot%` can redirect the teardown; the
+/// environment stays as the fallback, and the bare name as the last resort.
 #[cfg(windows)]
 fn taskkill_path() -> PathBuf {
+    if let Some(directory) = system_directory() {
+        let candidate = directory.join("taskkill.exe");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+
     let root = std::env::var_os("SystemRoot")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
@@ -918,6 +926,57 @@ fn taskkill_path() -> PathBuf {
         candidate
     } else {
         PathBuf::from("taskkill")
+    }
+}
+
+/// Asks the kernel for the system directory (`C:\Windows\System32`).
+///
+/// `GetSystemDirectoryW` never consults the environment, which is what makes it
+/// a trustworthy anchor when `PATH` or `%SystemRoot%` may be attacker controlled.
+/// Returns `None` when the call fails, so callers can fall back.
+#[cfg(windows)]
+fn system_directory() -> Option<PathBuf> {
+    // `MAX_PATH` covers every supported install; the API reports the required
+    // size (terminator included) when it does not, and the second call then
+    // allocates exactly that much.
+    const MAX_PATH: usize = 260;
+
+    let mut buffer = vec![0u16; MAX_PATH];
+    let mut written = unsafe {
+        win32_system::GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) as usize
+    };
+    if written == 0 {
+        return None;
+    }
+
+    if written >= buffer.len() {
+        buffer = vec![0u16; written];
+        written = unsafe {
+            win32_system::GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) as usize
+        };
+        if written == 0 || written >= buffer.len() {
+            return None;
+        }
+    }
+
+    let directory = String::from_utf16_lossy(&buffer[..written]);
+    if directory.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(directory))
+    }
+}
+
+/// Win32 bindings used to locate system binaries, declared by hand for the same
+/// reason as [`win32_job`]: the layer has no `windows-sys` dependency.
+#[cfg(windows)]
+mod win32_system {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        /// Fills `buffer` with the system directory; returns the characters
+        /// written (terminator excluded), or the required size when the buffer
+        /// is too small, or 0 on failure.
+        pub fn GetSystemDirectoryW(buffer: *mut u16, size: u32) -> u32;
     }
 }
 
@@ -2043,12 +2102,19 @@ mod tests {
             "the resolved taskkill must exist on disk: {path:?}"
         );
 
-        let root = std::env::var_os("SystemRoot")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        // The kernel, not the environment, must be the source of the directory.
+        let directory = system_directory().expect("GetSystemDirectoryW must report the system dir");
         assert!(
-            path.starts_with(&root),
-            "expected the system copy under {root:?}, got {path:?}"
+            directory.is_absolute(),
+            "the kernel-reported system directory must be absolute, got {directory:?}"
+        );
+        assert!(
+            directory.join("taskkill.exe").is_file(),
+            "the kernel-reported directory must hold taskkill: {directory:?}"
+        );
+        assert!(
+            path.starts_with(&directory),
+            "expected the system copy under {directory:?}, got {path:?}"
         );
     }
 }
