@@ -225,6 +225,9 @@ pub fn load_custom_tls(cert_path: &Path, key_path: &Path) -> Result<TlsMaterial>
 /// Load the existing self-signed pair, or generate one bound to `hostnames`.
 pub fn ensure_self_signed_tls(dir: &Path, hostnames: &[String]) -> Result<TlsMaterial> {
     std::fs::create_dir_all(dir).map_err(|e| RtError::io(dir.to_path_buf(), e))?;
+    // The directory that holds the private key stays readable only by this
+    // account (S-15): a sibling local user must not be able to read it.
+    crate::acl::restrict_or_warn(dir);
     let cert_path = dir.join(CERT_FILE);
     let key_path = dir.join(KEY_FILE);
     let fp_path = dir.join(FP_FILE);
@@ -234,6 +237,9 @@ pub fn ensure_self_signed_tls(dir: &Path, hostnames: &[String]) -> Result<TlsMat
             Ok(material) => {
                 // Keep the sidecar in sync; it is what the GUI shows as a QR/string.
                 let _ = std::fs::write(&fp_path, &material.fingerprint);
+                crate::acl::restrict_or_warn(&cert_path);
+                crate::acl::restrict_or_warn(&key_path);
+                crate::acl::restrict_or_warn(&fp_path);
                 return Ok(material);
             }
             Err(err) => {
@@ -248,6 +254,7 @@ pub fn ensure_self_signed_tls(dir: &Path, hostnames: &[String]) -> Result<TlsMat
 
     let material = generate_self_signed(dir, &cert_path, &key_path, hostnames)?;
     let _ = std::fs::write(&fp_path, &material.fingerprint);
+    crate::acl::restrict_or_warn(&fp_path);
     Ok(material)
 }
 
@@ -290,6 +297,11 @@ fn generate_self_signed(
 
     crate::config::write_atomic(cert_path, &cert_pem)?;
     crate::config::write_atomic(key_path, &key_pem)?;
+    // Tighten the private key to this account only (S-15). Best effort: the
+    // key is already written, so a failure here is logged rather than turned
+    // into a startup error.
+    crate::acl::restrict_or_warn(cert_path);
+    crate::acl::restrict_or_warn(key_path);
     tracing::info!(
         target: "rt_core::crypto",
         fingerprint = %fingerprint,

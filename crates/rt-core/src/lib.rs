@@ -13,6 +13,7 @@
 //! and the MCP bridge all sit on top of this crate, which keeps the transport
 //! swappable and makes every feature testable without a socket.
 
+pub mod acl;
 pub mod auth;
 pub mod capture;
 pub mod config;
