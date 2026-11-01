@@ -133,6 +133,20 @@ pub enum Command {
         #[command(flatten)]
         target: TargetArgs,
     },
+
+    /// Download a remote file, resuming an interrupted transfer.
+    Download {
+        /// Path of the file on the remote machine.
+        remote: String,
+        #[command(flatten)]
+        target: TargetArgs,
+        /// Directory (or target file path); defaults to `client.download_dir`.
+        #[arg(long)]
+        to: Option<std::path::PathBuf>,
+        /// Discard any partial file and start from zero.
+        #[arg(long)]
+        restart: bool,
+    },
 }
 
 #[derive(Debug, Args, Clone, Default)]
@@ -184,6 +198,7 @@ impl Command {
             Command::RotateCert => "rotate-cert",
             Command::Exec { .. } => "exec",
             Command::Info { .. } => "info",
+            Command::Download { .. } => "download",
         }
     }
 

@@ -244,6 +244,16 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             ))?;
             Ok(ExitCode::from(code as u8))
         }
+        Command::Download {
+            remote,
+            target,
+            to,
+            restart,
+        } => {
+            let runtime = rt_app::bootstrap::runtime()?;
+            let code = runtime.block_on(client_download(config_path, target, remote, to, restart))?;
+            Ok(ExitCode::from(code as u8))
+        }
     }
 }
 
@@ -428,8 +438,17 @@ async fn connect(
     args: &TargetArgs,
 ) -> anyhow::Result<rt_client::RemoteClient> {
     let boot = rt_app::bootstrap::bootstrap(Some(config), false, false)?;
-    let target = target_from(&boot, args);
-    let (user, token, password) = credentials(&boot, args)?;
+    connect_with_boot(&boot, args).await
+}
+
+/// Same as [`connect`] but reuses an already bootstrapped configuration, so
+/// commands that also need `config`/`paths` do not initialise logging twice.
+async fn connect_with_boot(
+    boot: &rt_app::Bootstrapped,
+    args: &TargetArgs,
+) -> anyhow::Result<rt_client::RemoteClient> {
+    let target = target_from(boot, args);
+    let (user, token, password) = credentials(boot, args)?;
     let client = rt_client::RemoteClient::new(target)?;
 
     // S-06: never hand a password to an unverified peer. When the certificate is
@@ -516,8 +535,82 @@ async fn client_exec(
     Ok(result.exit_code)
 }
 
-fn resolve_config_arg(config: Option<PathBuf>) -> anyhow::Result<PathBuf> {
-    match config {
+/// Downloads one remote file, resuming `<file>.part` when it is still valid.
+async fn client_download(
+    config: Option<PathBuf>,
+    args: TargetArgs,
+    remote: String,
+    to: Option<PathBuf>,
+    restart: bool,
+) -> anyhow::Result<i32> {
+    let config = resolve_config_arg(config)?;
+    let boot = rt_app::bootstrap::bootstrap(Some(&config), false, false)?;
+    let client = connect_with_boot(&boot, &args).await?;
+
+    let candidate = match to {
+        Some(path) if path.is_dir() => path.join(remote_file_name(&remote)),
+        Some(path) => path,
+        None => boot.paths.downloads_dir.join(remote_file_name(&remote)),
+    };
+
+    if restart {
+        for stale in [
+            candidate.clone(),
+            candidate.with_file_name(format!(
+                "{}.part",
+                candidate.file_name().unwrap_or_default().to_string_lossy()
+            )),
+            candidate.with_file_name(format!(
+                "{}.part.json",
+                candidate.file_name().unwrap_or_default().to_string_lossy()
+            )),
+        ] {
+            let _ = std::fs::remove_file(&stale);
+        }
+    }
+
+    let report = client
+        .download_resume(&remote, &candidate)
+        .await
+        .map_err(|err| anyhow::anyhow!("download failed: {}", err.message()))?;
+
+    println!("{}", report.path.display());
+    println!("  remote:      {}", report.remote_path);
+    println!("  size:        {}", rt_core::util::format_bytes(report.total_size));
+    println!(
+        "  resumed at:  {} bytes ({})",
+        report.resumed_from,
+        if report.resumed_from == 0 {
+            "started from zero"
+        } else {
+            "continued a previous attempt"
+        }
+    );
+    println!(
+        "  transferred: {} bytes",
+        rt_core::util::format_bytes(report.bytes_written)
+    );
+    if report.restarted {
+        println!("  note: the previous partial did not match the remote file and was discarded");
+    }
+    if report.bytes_written == 0 {
+        println!("  note: the file was already complete; pass --restart to download it again");
+    }
+    Ok(0)
+}
+
+/// Last path component of a remote path, sanitised for local use.
+fn remote_file_name(remote: &str) -> String {
+    rt_core::util::sanitize_filename(
+        remote
+            .rsplit(['\\', '/'])
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or("download.bin"),
+    )
+}
+
+fn resolve_config_arg(config: Option<PathBuf>) -> anyhow::Result<PathBuf> {    match config {
         Some(path) => Ok(path),
         None => rt_core::config::resolve_config_path(None)
             .map_err(|err| anyhow::anyhow!("cannot determine the configuration path: {err}")),
