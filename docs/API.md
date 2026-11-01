@@ -165,6 +165,27 @@ Uploads are written to a temporary file in the destination directory and
 atomically renamed, so a broken transfer never leaves a half-written file. The
 response (`WriteResult`) includes the SHA-256 of what landed on disk.
 
+### Resumable downloads
+
+`/fs/download` answers `Accept-Ranges: bytes` and honours `Range: bytes=N-`
+(206 + `Content-Range`; `416` for a stale offset). The server keeps no transfer
+state — resuming is a client convention:
+
+1. `GET /fs/stat` first and remember `size` + `modified_ms`.
+2. Stream into `<name>.part` and keep that bookkeeping next to it
+   (`<name>.part.json`); this is what `rt-client`'s `download_resume()` does.
+3. On the next run, if the sidecar still matches the remote `size` and
+   `modified_ms`, send `Range: bytes=<part length>-` and append; otherwise throw
+   the partial away and start over (`restarted: true` in the report).
+4. When the byte count matches `size`, rename `<name>.part` over the final name
+   and delete the sidecar.
+
+Streamed downloads are **not** charged against the inline read budget
+(`RT_READ_BUDGET_BYTES`, 512 MiB/min by default) — that budget only bounds how
+much one request materialises in memory, which is what `/fs/read` does.
+Downloads stream through HTTP back pressure instead, so a 1 GiB file moves in
+one go, and re-running the same transfer resumes where it broke.
+
 ## 6. System information and screen capture
 
 * `GET /api/v1/sysinfo` → `SysInfoSnapshot` (CPU, memory, disks, network,
@@ -218,6 +239,23 @@ Invoke-WebRequest -Uri "$base/api/v1/capture/raw?target=primary&format=png" `
 
 `GET /api/v1/ws/info` reports message-size limits and the maximum frame rate.
 
+### Capture streaming
+
+```jsonc
+// 5 fps JPEG preview, at most 30 frames, width capped at 1280
+{"type":"capture_stream","id":7,"request":{"format":"jpeg","quality":70,"max_width":1280},"fps":5,"max_frames":30}
+{"type":"capture_frame","id":7,"frame":{"seq":0,"meta":{"width":1280,"height":800,"bytes":83466,"duration_ms":247},"data_b64":"…"}}
+{"type":"capture_stopped","id":7,"reason":"max_frames","frames":30}
+```
+
+Frames are dropped, never queued without bound: a slow reader keeps only the
+newest frames (`rt-client`'s `CaptureStream::latest_frame()` drains the queue),
+and the stream always ends with `capture_stopped` carrying the reason
+(`max_frames`, `unsubscribed`, `scope`, `unavailable`, `closed`, …). Unsubscribe
+with `{"type":"unsubscribe","id":7}` — the server then sends exactly one more
+frame at most and closes the stream. Keep `fps` modest (1–15): every frame is a
+real GDI capture on the remote desktop, and a 4K JPEG costs ~250 ms of CPU there.
+
 ## 8. MCP bridge (recommended for harness tools)
 
 `remote-terminal.exe mcp` speaks JSON-RPC 2.0 over stdin/stdout (one JSON
@@ -233,6 +271,13 @@ message per line) and exposes 18 tools:
 `max_width`, `local_path` and `inline`. The image is written under
 `RT_CAPTURE_DIR` (default: current directory) and the resolved path is returned
 as `local_path`.
+
+`rt_fs_download` resumes by default: it keeps `<name>.part` +
+`<name>.part.json` under `RT_DOWNLOAD_DIR` (default: current directory) and
+answers `{ok, local_path, remote_path, total_size, bytes_written,
+resumed_from, restarted}`. Pass `"resume": false` to force a fresh transfer. A
+failed call explains where the partial file was kept, so calling the same tool
+again continues from there instead of starting over.
 
 Destructive tools (`rt_exec`, `rt_fs_write`, `rt_fs_delete`, `rt_fs_rename`,
 `rt_fs_copy`, `rt_fs_upload`) additionally require an operator lease; see
