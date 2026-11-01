@@ -289,10 +289,18 @@ impl Bridge {
             ),
             tool(
                 "rt_fs_download",
-                "Download a remote file to this machine (streaming). Returns the local path and size.",
+                "Download a remote file to this machine (streaming). Transfers resume by default: \
+                 if an attempt was interrupted, calling the tool again continues from the bytes \
+                 already on disk instead of starting over. Returns the local path, the remote size, \
+                 how many bytes this call moved and where it resumed from.",
                 json!({
                     "path": {"type": "string", "description": "Remote path."},
-                    "local_path": {"type": "string", "description": "Destination file; defaults to <download_dir>/<name>."}
+                    "local_path": {"type": "string", "description": "Destination file; defaults to <download_dir>/<name>."},
+                    "resume": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "Resume an interrupted transfer from its <local>.part file (default true). Set false to always start from zero."
+                    }
                 }),
             ),
             tool(
@@ -527,21 +535,46 @@ impl Bridge {
         let default_name = rt_core::util::sanitize_filename(
             path.rsplit(['\\', '/']).next().unwrap_or("download.bin"),
         );
+        // S-19: the destination is still resolved through the local sandbox, no
+        // matter which transfer path runs below.
         let local = resolve_local_target(
             arg_str(args, "local_path"),
             "RT_DOWNLOAD_DIR",
             || default_name.clone(),
         )?;
-        let bytes = self
+
+        // Resuming is the default: an interrupted transfer leaves `<local>.part`
+        // behind, and the next call continues from there instead of restarting.
+        if !arg_bool(args, "resume").unwrap_or(true) {
+            let bytes = self
+                .client
+                .download_to(&path, &local)
+                .await
+                .map_err(|e| download_error(&path, &local, e.message()))?;
+            return Ok(json!({
+                "ok": true,
+                "local_path": local.display().to_string(),
+                "remote_path": path,
+                "total_size": bytes,
+                "bytes_written": bytes,
+                "resumed_from": 0,
+                "restarted": false,
+            }));
+        }
+
+        let report = self
             .client
-            .download_to(&path, &local)
+            .download_resume(&path, &local)
             .await
-            .map_err(|e| e.message())?;
+            .map_err(|e| download_error(&path, &local, e.message()))?;
         Ok(json!({
             "ok": true,
-            "remote_path": path,
-            "local_path": local.display().to_string(),
-            "bytes": bytes
+            "local_path": report.path.display().to_string(),
+            "remote_path": report.remote_path,
+            "total_size": report.total_size,
+            "bytes_written": report.bytes_written,
+            "resumed_from": report.resumed_from,
+            "restarted": report.restarted,
         }))
     }
 
@@ -811,9 +844,36 @@ fn resolve_local_target(
     Ok(candidate)
 }
 
+/// Partial-file path of a resumable download (`<file>.part`).
+///
+/// Mirrors the naming used by [`rt_client::RemoteClient::download_resume`] so
+/// the failure message can report how much of an interrupted transfer survived
+/// and how many bytes the next call would resume from.
+fn partial_download_path(local: &Path) -> Option<PathBuf> {
+    let name = local.file_name()?.to_string_lossy().to_string();
+    Some(local.with_file_name(format!("{name}.part")))
+}
+
+/// Failure message for a download: names both ends of the transfer and tells the
+/// operator whether a retry continues from the bytes already on disk.
+fn download_error(remote: &str, local: &Path, reason: String) -> String {
+    let mut message = format!("download `{remote}` -> {} failed: {reason}", local.display());
+    let kept_bytes = partial_download_path(local)
+        .and_then(|part| std::fs::metadata(&part).ok().map(|meta| (part, meta)))
+        .filter(|(_, meta)| meta.is_file() && meta.len() > 0)
+        .map(|(part, meta)| (part, meta.len()));
+    if let Some((part, bytes)) = kept_bytes {
+        message.push_str(&format!(
+            "; the partial download is kept at {} ({bytes} bytes) — calling rt_fs_download \
+             again resumes from those {bytes} bytes",
+            part.display()
+        ));
+    }
+    message
+}
+
 /// Inline (`content_b64`) writes above this size must use streaming upload (S-18).
 const MAX_INLINE_WRITE_BYTES: usize = 64 * 1024 * 1024;
-
 
 #[cfg(test)]
 mod tests {
@@ -887,5 +947,49 @@ mod tests {
         let next = unique_path(&dir, "a.txt");
         assert_eq!(next.file_name().unwrap(), "a (1).txt");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn download_tool_documents_resume() {
+        let tools = Bridge::tool_definitions();
+        let download = tools
+            .iter()
+            .find(|tool| tool["name"] == "rt_fs_download")
+            .expect("rt_fs_download definition");
+        assert!(
+            download["description"]
+                .as_str()
+                .unwrap()
+                .to_lowercase()
+                .contains("resume"),
+            "the description must tell the agent that transfers resume"
+        );
+        let resume = &download["inputSchema"]["properties"]["resume"];
+        assert_eq!(resume["type"], "boolean");
+        assert_eq!(resume["default"], true);
+        assert!(resume["description"].as_str().unwrap().contains("true"));
+        // `resume` stays optional: only `path` is required.
+        let required = download["inputSchema"]["required"].as_array().unwrap();
+        assert_eq!(required, &vec![json!("path")]);
+    }
+
+    #[test]
+    fn partial_path_mirrors_the_client_convention() {
+        let local = Path::new(r"C:\downloads\report.zip");
+        let part = partial_download_path(local).expect("partial path");
+        assert_eq!(part, PathBuf::from(r"C:\downloads\report.zip.part"));
+        assert_eq!(partial_download_path(Path::new("")), None);
+    }
+
+    /// `rt_fs_download` reads the flag exactly like this: absent means resume.
+    #[test]
+    fn resume_flag_defaults_on_and_parses_explicit_values() {
+        let resume = |args: &Value| arg_bool(args, "resume").unwrap_or(true);
+        assert!(resume(&json!({"path": "a.txt"})));
+        assert!(!resume(&json!({"path": "a.txt", "resume": false})));
+        assert!(!resume(&json!({"path": "a.txt", "resume": "false"})));
+        assert!(!resume(&json!({"path": "a.txt", "resume": 0})));
+        assert!(resume(&json!({"path": "a.txt", "resume": true})));
+        assert!(resume(&json!({"path": "a.txt", "resume": "yes"})));
     }
 }
