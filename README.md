@@ -101,6 +101,7 @@ gen-key [名称] [--scope] [--write]
 fingerprint <host[:port]> 获取服务端 TLS 证书指纹
 approve [工具] [--minutes N] [--revoke] [--list]
                           为破坏性 MCP 工具授予/查看/撤销限时审批
+rotate-cert               重新生成自签证书（旧文件留作 *.old，之后需重新固定指纹）
 exec <命令...>            通过服务端在远程执行命令
 info                      打印远程服务端的身份信息
 ```
@@ -183,7 +184,13 @@ MCP 是被模型驱动的，一次提示注入或一次幻觉调用就等于在�
 * `server.allow_insecure_lan` 会关闭 TLS，只建议在调试时的本机回环上使用。`serve`（CLI 与
   GUI 都是）会拒绝启动 `validate()` 不通过的配置，所以一个笔误不会把密码悄悄变成明文。
 * **不建议**把端口暴露到公网。必须暴露时，请套 VPN 或反向代理，并保持指纹固定。
-* 审计日志（`logs/audit.jsonl`）记录每一次有副作用的调用。
+* 审计日志（`logs/audit.jsonl`）记录每一次有副作用的调用（命令执行记「前 200 字符 + 完整命令
+  sha256」，事后仍可核对）；默认按 16 MiB 轮转、保留 10 份。把 `logging.audit_fail_closed`
+  设为 `true` 后，写不进审计的破坏性请求会直接 `503` 而不会静默改机器（读操作不受影响）。
+* 证书需要轮换时用 `remote-terminal rotate-cert`：旧文件留作 `*.old`，之后所有已固定的客户端都要
+  重新 `fingerprint` 并更新固定值。
+* 服务端自带过载保护：阻塞型工作（文件 I/O、起进程、截屏）共用 64 个准入名额，2 秒内拿不到就
+  `503` + `Retry-After`；登录的密码校验**不占**这个名额，池满时仍能登录。
 
 ## 目录结构
 

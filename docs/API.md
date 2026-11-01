@@ -30,8 +30,24 @@ surface; `GET /healthz` needs no authentication and is safe for probes.
   config (`server.api_keys[].key_sha256`). Generate with
   `remote-terminal.exe gen-key <name> --write`.
 * **Brute force** — `server.login_max_attempts` failures lock an IP for
-  `server.login_lockout_secs`; all other calls are token-bucket limited by
-  `server.rate_limit_per_min`; `server.ip_allowlist` restricts source addresses.
+  `server.login_lockout_secs`; on top of that each account has a global counter
+  (50 failures/hour) with exponential back-off, so a distributed attack cannot
+  iterate one user from many addresses. Login failures are always answered with
+  the same `401 unauthorized` / `"invalid username or password"` (the remaining
+  attempts only go to the audit log, never to the caller). All other calls are
+  token-bucket limited by `server.rate_limit_per_min`; `server.ip_allowlist`
+  restricts source addresses.
+* **Revocation is live** — `users` / `api_keys` are re-read from `config.toml`
+  within a second (mtime+size check), so disabling a user or deleting a key
+  takes effect immediately without a restart. Already-issued session tokens
+  stay valid until they expire or are revoked with `POST /auth/logout`.
+* **Read budget** — `fs/read` and `fs/download` are audited and metered per
+  session: 512 MiB per minute, then `429 rate_limited` with `retry_after_secs`.
+* **Overload shedding** — blocking work (file I/O, process spawns, capture) is
+  admitted through 64 shared slots; if none frees up within 2 s the request gets
+  `503 unavailable` with `Retry-After: 1`. When `logging.audit_fail_closed` is
+  on, a mutating request whose audit record cannot be written also answers 503
+  instead of silently changing the machine without a trace.
 * **Path jail** — every filesystem path goes through `rt_core::pathscope`: for
   `workspace` scope the session can only touch `server.workspace.root` (default
   `<exe dir>/workspace`); for `full` scope the whole machine is reachable.
@@ -173,7 +189,8 @@ Invoke-WebRequest -Uri "$base/api/v1/capture/raw?target=primary&format=png" `
 ## 7. WebSocket
 
 1. `POST /api/v1/auth/ws-ticket` (POST only) → `{ ticket, expires_in_secs, ws_path }`
-   (tickets are single use and bound to your session).
+   (tickets are single use, valid for 15 s and bound to both your session and
+   the IP you got them from — connect immediately, and from the same address).
 2. Connect to `wss://host:port/api/v1/ws?ticket=…`.
 3. Client → server (`WsClientMessage`, tagged by `type`):
    `ping`, `exec`, `cancel`, `capture_stream`, `subscribe_logs`,
@@ -276,9 +293,9 @@ Every failure returns the same envelope with a matching HTTP status:
 | `unsupported_media_type` | 415 | wrong `Content-Type` |
 | `range_not_satisfiable` | 416 | bad `Range` header |
 | `timeout` | 408 | command exceeded its limit |
-| `rate_limited` | 429 | token bucket empty (see `retry_after_secs`) |
+| `rate_limited` | 429 | token bucket, read budget or account back-off exhausted (see `retry_after_secs`) |
 | `locked` | 423 | login lockout |
-| `unavailable` | 503 | service not ready |
+| `unavailable` | 503 | overloaded (admission full), shutting down, or fail-closed audit cannot record the change |
 | `not_implemented` | 501 | capability not built on this server |
 | `internal` | 500 | unexpected failure (check the server log) |
 
