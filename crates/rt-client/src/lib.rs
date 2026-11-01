@@ -622,30 +622,212 @@ impl RemoteClient {
     /// Downloads into `client.download_dir`-style directory chosen by caller,
     /// picking a non-colliding file name.
     pub async fn download_auto(&self, remote_path: &str, dir: &Path) -> Result<PathBuf> {
-        let name = rt_core::util::sanitize_filename(
-            remote_path
-                .rsplit(['\\', '/'])
-                .next()
-                .filter(|s| !s.is_empty())
-                .unwrap_or("download.bin"),
-        );
-        let mut candidate = dir.join(&name);
-        let mut index = 1;
-        while candidate.exists() {
-            let stem = Path::new(&name)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("file");
-            let ext = Path::new(&name)
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| format!(".{e}"))
-                .unwrap_or_default();
-            candidate = dir.join(format!("{stem} ({index}){ext}"));
-            index += 1;
-        }
+        let candidate = unique_download_path(dir, remote_path);
         self.download_to(remote_path, &candidate).await?;
         Ok(candidate)
+    }
+
+    /// Downloads `remote_path` into `local`, resuming an interrupted attempt.
+    ///
+    /// The partial payload lives in `<local>.part` and `<local>.part.json`
+    /// records the remote size/mtime it was started from. If the server copy
+    /// changed in between, the transfer restarts from zero rather than
+    /// stitching two revisions together.
+    pub async fn download_resume(
+        &self,
+        remote_path: &str,
+        local: &Path,
+    ) -> Result<DownloadReport> {
+        let stat = self.stat(remote_path).await?;
+        if stat.entry.is_dir {
+            return Err(ClientError::Request(format!(
+                "`{remote_path}` is a directory; download files individually"
+            )));
+        }
+        let total_size = stat.entry.size;
+        let modified_ms = stat.entry.modified_ms;
+        if let Some(parent) = local.parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+        }
+
+        let (part, meta_path) = part_paths(local);
+        let finished = tokio::fs::metadata(local)
+            .await
+            .map(|meta| meta.is_file() && meta.len() == total_size)
+            .unwrap_or(false);
+        if finished {
+            let _ = tokio::fs::remove_file(&part).await;
+            let _ = tokio::fs::remove_file(&meta_path).await;
+            return Ok(DownloadReport {
+                path: local.to_path_buf(),
+                remote_path: remote_path.to_string(),
+                total_size,
+                resumed_from: total_size,
+                bytes_written: 0,
+                restarted: false,
+            });
+        }
+
+        let previous = read_resume_meta(&meta_path).await;
+        let resumable = previous.as_ref().is_some_and(|meta| {
+            meta.remote_path == remote_path
+                && meta.total_size == total_size
+                && meta.modified_ms == modified_ms
+        });
+        let mut resumed_from = if resumable {
+            file_len(&part).await.min(total_size)
+        } else {
+            0
+        };
+        if !resumable {
+            let _ = tokio::fs::remove_file(&part).await;
+        }
+        write_resume_meta(
+            &meta_path,
+            &ResumeMeta {
+                remote_path: remote_path.to_string(),
+                total_size,
+                modified_ms,
+                started_at_ms: chrono::Utc::now().timestamp_millis(),
+            },
+        )
+        .await?;
+
+        let mut restarted = false;
+        let mut attempts: u32 = 0;
+        loop {
+            let offset = file_len(&part).await;
+            if offset > total_size {
+                // A stale or corrupt partial; start over.
+                let _ = tokio::fs::remove_file(&part).await;
+                resumed_from = 0;
+                restarted = true;
+                continue;
+            }
+
+            let mut request = self
+                .request(reqwest::Method::GET, "api/v1/fs/download")?
+                .query(&[("path", remote_path.to_string())])
+                .timeout(Duration::from_secs(60 * 60));
+            if offset > 0 {
+                request = request.header(reqwest::header::RANGE, format!("bytes={offset}-"));
+            }
+
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(err) => {
+                    attempts += 1;
+                    if attempts > 3 {
+                        return Err(err.into());
+                    }
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    continue;
+                }
+            };
+
+            let status = response.status();
+            if status == StatusCode::RANGE_NOT_SATISFIABLE {
+                let _ = tokio::fs::remove_file(&part).await;
+                resumed_from = 0;
+                restarted = true;
+                attempts += 1;
+                if attempts > 4 {
+                    return Err(ClientError::Transport(format!(
+                        "the server rejected the resume range for `{remote_path}`"
+                    )));
+                }
+                continue;
+            }
+            if !status.is_success() {
+                let fallback = response.text().await.unwrap_or_default();
+                let body = serde_json::from_str::<ApiErrorBody>(&fallback).ok();
+                return Err(ClientError::Api {
+                    status: status.as_u16(),
+                    body,
+                    fallback,
+                });
+            }
+
+            // A 206 means the server honoured the offset; a 200 means it ignored
+            // it, so the partial file has to be truncated and rewritten.
+            let append = status == StatusCode::PARTIAL_CONTENT && offset > 0;
+            if !append && offset > 0 {
+                resumed_from = 0;
+                restarted = true;
+            }
+            let mut file = if append {
+                tokio::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&part)
+                    .await?
+            } else {
+                tokio::fs::File::create(&part).await?
+            };
+
+            let mut stream = response.bytes_stream();
+            let mut failure: Option<ClientError> = None;
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(chunk) => {
+                        if let Err(err) =
+                            tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await
+                        {
+                            failure = Some(ClientError::Io(err.to_string()));
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        failure = Some(ClientError::Transport(err.to_string()));
+                        break;
+                    }
+                }
+            }
+            let _ = tokio::io::AsyncWriteExt::flush(&mut file).await;
+            drop(file);
+
+            if let Some(err) = failure {
+                attempts += 1;
+                if attempts > 3 {
+                    return Err(err);
+                }
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                continue;
+            }
+            break;
+        }
+
+        let written = file_len(&part).await;
+        if written != total_size {
+            return Err(ClientError::Transport(format!(
+                "download of `{remote_path}` stopped at {written} of {total_size} bytes; run it again to resume"
+            )));
+        }
+        if local.exists() {
+            let _ = tokio::fs::remove_file(local).await;
+        }
+        tokio::fs::rename(&part, local).await?;
+        let _ = tokio::fs::remove_file(&meta_path).await;
+
+        Ok(DownloadReport {
+            path: local.to_path_buf(),
+            remote_path: remote_path.to_string(),
+            total_size,
+            resumed_from,
+            bytes_written: total_size.saturating_sub(resumed_from),
+            restarted,
+        })
+    }
+
+    /// [`Self::download_resume`] with automatic, non-colliding naming.
+    pub async fn download_resume_auto(
+        &self,
+        remote_path: &str,
+        dir: &Path,
+    ) -> Result<DownloadReport> {
+        let candidate = unique_download_path(dir, remote_path);
+        self.download_resume(remote_path, &candidate).await
     }
 
     // -- system info --------------------------------------------------------
@@ -795,6 +977,93 @@ impl RemoteClient {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Resumable downloads
+// ---------------------------------------------------------------------------
+
+/// Outcome of [`RemoteClient::download_resume`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DownloadReport {
+    /// Final path on this machine.
+    pub path: PathBuf,
+    /// Source path on the remote machine.
+    pub remote_path: String,
+    /// Size of the remote file (`0` for an empty file).
+    pub total_size: u64,
+    /// Bytes that already existed before this call continued the transfer.
+    pub resumed_from: u64,
+    /// Bytes transferred by this call.
+    pub bytes_written: u64,
+    /// True when a stale partial had to be thrown away.
+    pub restarted: bool,
+}
+
+/// Provenance of `<file>.part` so a resume never mixes two revisions.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ResumeMeta {
+    remote_path: String,
+    total_size: u64,
+    #[serde(default)]
+    modified_ms: Option<i64>,
+    started_at_ms: i64,
+}
+
+fn part_paths(local: &Path) -> (PathBuf, PathBuf) {
+    let name = local
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "download.bin".to_string());
+    (
+        local.with_file_name(format!("{name}.part")),
+        local.with_file_name(format!("{name}.part.json")),
+    )
+}
+
+async fn file_len(path: &Path) -> u64 {
+    match tokio::fs::metadata(path).await {
+        Ok(meta) if meta.is_file() => meta.len(),
+        _ => 0,
+    }
+}
+
+async fn read_resume_meta(path: &Path) -> Option<ResumeMeta> {
+    let text = tokio::fs::read_to_string(path).await.ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+async fn write_resume_meta(path: &Path, meta: &ResumeMeta) -> std::io::Result<()> {
+    let text = serde_json::to_string(meta)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    tokio::fs::write(path, text).await
+}
+
+/// Picks a file name inside `dir` that does not collide with an existing file.
+fn unique_download_path(dir: &Path, remote_path: &str) -> PathBuf {
+    let name = rt_core::util::sanitize_filename(
+        remote_path
+            .rsplit(['\\', '/'])
+            .next()
+            .filter(|part| !part.is_empty())
+            .unwrap_or("download.bin"),
+    );
+    let mut candidate = dir.join(&name);
+    let mut index = 1;
+    while candidate.exists() {
+        let stem = Path::new(&name)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("file");
+        let ext = Path::new(&name)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| format!(".{ext}"))
+            .unwrap_or_default();
+        candidate = dir.join(format!("{stem} ({index}){ext}"));
+        index += 1;
+    }
+    candidate
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -853,5 +1122,48 @@ mod tests {
         let stem = Path::new("a.txt").file_stem().and_then(|s| s.to_str()).unwrap();
         assert_eq!(stem, "a");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resumable_download_layout() {
+        let local = Path::new("C:/tmp/report.pdf");
+        let (part, meta) = part_paths(local);
+        assert!(part.to_string_lossy().ends_with("report.pdf.part"));
+        assert!(meta.to_string_lossy().ends_with("report.pdf.part.json"));
+    }
+
+    #[test]
+    fn unique_download_paths_add_a_suffix() {
+        let dir = std::env::temp_dir().join(format!(
+            "rt_dl_unique_{}_{}",
+            std::process::id(),
+            rt_core::crypto::random_token(4)
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let first = unique_download_path(&dir, "C:\\data\\note.txt");
+        assert_eq!(first.file_name().and_then(|n| n.to_str()), Some("note.txt"));
+        std::fs::write(&first, b"x").expect("write");
+        let second = unique_download_path(&dir, "D:/other/note.txt");
+        assert_eq!(
+            second.file_name().and_then(|n| n.to_str()),
+            Some("note (1).txt")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_meta_roundtrips_through_json() {
+        let meta = ResumeMeta {
+            remote_path: "\\\\srv\\share\\payload.bin".into(),
+            total_size: 4096,
+            modified_ms: Some(1_700_000_000_000),
+            started_at_ms: 1_700_000_000_500,
+        };
+        let text = serde_json::to_string(&meta).expect("encode");
+        let back: ResumeMeta = serde_json::from_str(&text).expect("decode");
+        assert_eq!(back.remote_path, meta.remote_path);
+        assert_eq!(back.total_size, 4096);
+        assert_eq!(back.modified_ms, meta.modified_ms);
+        assert_eq!(back.started_at_ms, meta.started_at_ms);
     }
 }

@@ -1,15 +1,20 @@
 //! WebSocket channel: live exec output, capture streaming, log/status
 //! subscriptions.
 //!
-//! Two layers are offered:
+//! Three layers are offered:
 //! * [`WsClient`] — a thin, manually driven connection (one `send`, one `recv`),
 //!   handy for scripts and tests.
 //! * [`spawn_session`] — the driver the GUI uses: an outgoing queue plus an
 //!   incoming stream, so `egui` never has to hold a socket.
+//! * [`spawn_capture_stream`] — a dedicated socket for one screen/window stream
+//!   (the server sends JPEG frames at the requested fps, see
+//!   `WsClientMessage::CaptureStream`), so a preview never fights with the exec
+//!   page for the shared session.
 
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use rt_protocol::capture::CaptureFrame;
 use rt_protocol::ws::{WsClientMessage, WsServerMessage};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -193,6 +198,189 @@ pub fn spawn_session(client: RemoteClient) -> WsSession {
         inbound: in_rx,
         closed: close_rx,
         task,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live capture streams
+// ---------------------------------------------------------------------------
+
+/// A live screen/window stream driven over its own WebSocket.
+///
+/// The stream is deliberately lossy: frames arrive faster than the UI can
+/// paint, so [`Self::latest_frame`] drops everything but the newest one. When
+/// the server stops (max frames reached, capture failure, blocked queue) the
+/// reason comes back from [`Self::poll_stop_reason`].
+pub struct CaptureStream {
+    /// The stream id used in `Unsubscribe` and echoed by the server.
+    pub id: u64,
+    frames: mpsc::UnboundedReceiver<CaptureFrame>,
+    stopped: mpsc::UnboundedReceiver<String>,
+    closed: tokio::sync::watch::Receiver<Option<String>>,
+    outbound: mpsc::UnboundedSender<WsClientMessage>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl CaptureStream {
+    /// Pops the oldest frame, preserving order.
+    pub fn try_frame(&mut self) -> Option<CaptureFrame> {
+        self.frames.try_recv().ok()
+    }
+
+    /// Pops frames until the queue is empty and returns the newest one, which
+    /// is what a preview wants: painting an outdated frame only adds latency.
+    pub fn latest_frame(&mut self) -> Option<CaptureFrame> {
+        let mut latest = None;
+        while let Ok(frame) = self.frames.try_recv() {
+            latest = Some(frame);
+        }
+        latest
+    }
+
+    /// The reason the server stopped the stream, or the socket failure.
+    pub fn poll_stop_reason(&mut self) -> Option<String> {
+        if let Ok(reason) = self.stopped.try_recv() {
+            return Some(reason);
+        }
+        self.closed.borrow().clone()
+    }
+
+    /// True once the socket ended for any reason.
+    pub fn is_closed(&self) -> bool {
+        self.closed.borrow().is_some()
+    }
+
+    /// Asks the server to stop the stream (best effort) without dropping the
+    /// handle; the socket task keeps running until [`Drop`].
+    pub fn request_stop(&self) {
+        let _ = self
+            .outbound
+            .send(WsClientMessage::Unsubscribe { id: self.id });
+    }
+
+    /// Stops the stream and closes the socket immediately.
+    pub fn stop(&mut self) {
+        self.request_stop();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for CaptureStream {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Opens a dedicated socket and starts streaming frames for `request`.
+///
+/// The returned handle never blocks the caller: connect failures surface
+/// through [`CaptureStream::poll_stop_reason`] so the UI can fall back to
+/// one-shot captures.
+pub fn spawn_capture_stream(
+    client: RemoteClient,
+    id: u64,
+    request: rt_protocol::CaptureRequest,
+    fps: u8,
+    max_frames: Option<u32>,
+) -> CaptureStream {
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<WsClientMessage>();
+    let (frame_tx, frame_rx) = mpsc::unbounded_channel::<CaptureFrame>();
+    let (stop_tx, stop_rx) = mpsc::unbounded_channel::<String>();
+    let (close_tx, close_rx) = tokio::sync::watch::channel(None::<String>);
+
+    let task = tokio::spawn(async move {
+        let ws = match WsClient::connect(&client).await {
+            Ok(ws) => ws,
+            Err(e) => {
+                let message = e.message();
+                let _ = stop_tx.send(message.clone());
+                let _ = close_tx.send(Some(message));
+                return;
+            }
+        };
+
+        let (mut sink, mut source) = ws.split();
+        let request_message = WsClientMessage::CaptureStream {
+            id,
+            request,
+            fps,
+            max_frames,
+        };
+
+        let writer = tokio::spawn(async move {
+            if let Ok(text) = serde_json::to_string(&request_message) {
+                if sink.send(Message::Text(text.into())).await.is_err() {
+                    return;
+                }
+            }
+            while let Some(message) = out_rx.recv().await {
+                let Ok(text) = serde_json::to_string(&message) else {
+                    continue;
+                };
+                if sink.send(Message::Text(text.into())).await.is_err() {
+                    break;
+                }
+            }
+            let _ = sink.close().await;
+        });
+
+        let mut reason: Option<String> = None;
+        loop {
+            match source.next().await {
+                None => break,
+                Some(Err(e)) => {
+                    reason = Some(format!("websocket error: {e}"));
+                    break;
+                }
+                Some(Ok(Message::Text(text))) => {
+                    match serde_json::from_str::<WsServerMessage>(text.as_str()) {
+                        Ok(WsServerMessage::CaptureFrame { id: stream, frame }) if stream == id => {
+                            if frame_tx.send(frame).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(WsServerMessage::CaptureStopped {
+                            id: stream,
+                            reason: why,
+                            ..
+                        }) if stream == id => {
+                            reason = Some(why);
+                            break;
+                        }
+                        Ok(WsServerMessage::Error {
+                            id: Some(stream),
+                            error,
+                        }) if stream == id => {
+                            reason = Some(format!("{}: {}", error.code.as_str(), error.message));
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::debug!(error = %e, "ignored malformed websocket frame"),
+                    }
+                }
+                Some(Ok(Message::Close(frame))) => {
+                    reason = frame.map(|f| f.reason.to_string());
+                    break;
+                }
+                Some(Ok(_)) => {}
+            }
+        }
+
+        let final_reason = reason.unwrap_or_else(|| "stream closed by the server".to_string());
+        let _ = stop_tx.send(final_reason.clone());
+        let _ = close_tx.send(Some(final_reason));
+        writer.abort();
+    });
+
+    CaptureStream {
+        id,
+        frames: frame_rx,
+        stopped: stop_rx,
+        closed: close_rx,
+        outbound: out_tx,
+        task: Some(task),
     }
 }
 
