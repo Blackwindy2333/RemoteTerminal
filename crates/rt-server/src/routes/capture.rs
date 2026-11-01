@@ -17,7 +17,7 @@ use rt_protocol::{
 use serde::Deserialize;
 
 use crate::middleware::{
-    blocking, json_body, req_id, require_full_scope, session_of, ApiErr, ApiQuery, ApiResult,
+    json_body, req_id, require_full_scope, session_of, ApiErr, ApiQuery, ApiResult,
 };
 use crate::state::AppState;
 
@@ -40,22 +40,22 @@ pub(crate) struct RawQuery {
 
 /// `GET /api/v1/capture/screens` — connected displays.
 pub(crate) async fn screens(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     req: Request,
 ) -> ApiResult<Json<ScreenListResponse>> {
     let _ctx = session_of(&req)?;
-    let screens = blocking(rt_core::capture::list_screens).await?;
+    let screens = state.spawn_blocking_admitted(rt_core::capture::list_screens).await?;
     Ok(Json(ScreenListResponse { screens }))
 }
 
 /// `GET /api/v1/capture/windows` — capturable top-level windows.
 pub(crate) async fn windows(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     req: Request,
 ) -> ApiResult<Json<WindowListResponse>> {
     let ctx = session_of(&req)?;
     require_full_scope(&ctx, "listing windows")?;
-    let windows = blocking(rt_core::capture::list_windows).await?;
+    let windows = state.spawn_blocking_admitted(rt_core::capture::list_windows).await?;
     Ok(Json(WindowListResponse {
         windows,
         truncated: false,
@@ -76,7 +76,7 @@ pub(crate) async fn capture(
     let body: CaptureRequest = json_body(req, json_limit(&cfg.server.max_json_kb)).await?;
     let target_label = format!("{:?}", body.target);
 
-    let result = blocking(move || rt_core::capture::capture(&body)).await;
+    let result = state.spawn_blocking_admitted(move || rt_core::capture::capture(&body)).await;
     state.record_audit(
         ctx.audit(
             "capture.request",
@@ -118,7 +118,7 @@ pub(crate) async fn raw(
     };
 
     // `capture_bytes` skips the base64 round-trip `capture` needs for JSON.
-    let result = blocking(move || rt_core::capture::capture_bytes(&request)).await;
+    let result = state.spawn_blocking_admitted(move || rt_core::capture::capture_bytes(&request)).await;
     let response = match result {
         Ok((meta, bytes)) => {
             let len = bytes.len();

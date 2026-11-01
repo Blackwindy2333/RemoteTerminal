@@ -456,12 +456,21 @@ fn start_exec(
                 return;
             }
         };
+        let admission = match crate::middleware::admit(&state.blocking_slots()).await {
+            Ok(permit) => permit,
+            Err(err) => {
+                let detail = crate::middleware::api_detail(RtError::Unavailable(err.message().into()));
+                let _ = out.send(WsServerMessage::error(Some(id), detail));
+                return;
+            }
+        };
 
         let (event_tx, mut event_rx) = unbounded_channel::<ExecEvent>();
         let runner_control = runner;
 
         let blocking = tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            let _admission = admission;
             let mut stdout_tail = String::new();
             let mut stderr_tail = String::new();
             let result = {
@@ -567,6 +576,7 @@ fn start_capture(
     let effective = fps.max(1).min(max_fps);
     let period = Duration::from_millis((1000 / u64::from(effective)).max(1));
     let out = out.clone();
+    let slots = state.blocking_slots();
 
     // Full-resolution PNG costs >1 MB and ~165 ms per frame, so a preview
     // stream would stall immediately; cap the width when the client did not ask
@@ -583,8 +593,15 @@ fn start_capture(
 
         loop {
             ticker.tick().await;
+            // Frames are best-effort: when the blocking pool is saturated the
+            // tick is skipped rather than queued, so the stream never backs up.
+            let admission = match slots.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => continue,
+            };
             let request = request.clone();
             let capture = tokio::task::spawn_blocking(move || {
+                let _admission = admission;
                 rt_core::capture::capture_frame(&request, seq)
             })
             .await;
@@ -690,9 +707,19 @@ fn start_status(
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
+            // Best-effort sampling: skip a tick instead of queueing behind a
+            // saturated blocking pool.
+            let admission = match state.blocking_slots().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => continue,
+            };
             let service = state.sysinfo();
             let active = state.session_store().count();
-            let sample = tokio::task::spawn_blocking(move || service.quick(active)).await;
+            let sample = tokio::task::spawn_blocking(move || {
+                let _admission = admission;
+                service.quick(active)
+            })
+            .await;
             match sample {
                 Ok(Ok(status)) => {
                     if out.send(WsServerMessage::Status { id, status }) == Queued::Closed {

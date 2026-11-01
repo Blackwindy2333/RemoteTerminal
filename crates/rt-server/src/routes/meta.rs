@@ -7,7 +7,7 @@ use axum::Json;
 use rt_protocol::ws::LogEvent;
 use serde::Deserialize;
 
-use crate::middleware::{blocking, require_full_scope, session_of, ApiQuery, ApiResult};
+use crate::middleware::{require_full_scope, session_of, ApiQuery, ApiResult};
 use crate::state::AppState;
 
 /// `?limit=` shared by the log and audit tails.
@@ -45,7 +45,7 @@ pub(crate) async fn audit(
     require_full_scope(&ctx, "reading the audit trail")?;
     let limit = query.limit.unwrap_or(DEFAULT_TAIL).clamp(1, MAX_TAIL);
     let path = state.paths().audit_file.clone();
-    let records = blocking(move || Ok(tail_json_lines(&path, limit))).await?;
+    let records = state.spawn_blocking_admitted(move || Ok(tail_json_lines(&path, limit))).await?;
     Ok(Json(records))
 }
 

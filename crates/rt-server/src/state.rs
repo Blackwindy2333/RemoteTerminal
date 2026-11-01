@@ -25,6 +25,8 @@ use rt_protocol::ws::{LogEvent, WsInfo, WS_PATH};
 use rt_protocol::{AppInfo, Scope, ServerInfo, SessionInfo};
 use tokio::sync::Semaphore;
 
+use crate::middleware::ApiResult;
+
 /// Lifetime of a WebSocket upgrade ticket.
 ///
 /// Short on purpose: the ticket travels in the query string, so it ends up in
@@ -69,6 +71,13 @@ pub const WS_MAX_CONCURRENT_STREAMS: u32 = 16;
 
 /// Largest slice `GET /api/v1/fs/read` will return in one response.
 pub const MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Blocking jobs the server admits at once before it starts shedding load.
+///
+/// The blocking pool itself is shared with the rest of the process, so this is
+/// deliberately smaller than a naive thread count: past this point waiting
+/// requests get `503` with a retry hint instead of an ever-growing queue.
+pub const BLOCKING_ADMISSION_SLOTS: usize = 64;
 
 /// Everything the router needs that is built once at start-up.
 pub struct ServerOptions {
@@ -352,6 +361,7 @@ pub struct AppState {
     rate_limiter: RateLimiter,
     sysinfo: Arc<SysInfoService>,
     exec_slots: Arc<Semaphore>,
+    blocking_slots: Arc<Semaphore>,
     tickets: Mutex<HashMap<String, Ticket>>,
     creds: Mutex<Arc<Credentials>>,
     reload: Mutex<ReloadState>,
@@ -387,6 +397,7 @@ impl AppState {
         );
         let rate_limiter = RateLimiter::new(config.server.rate_limit_per_min);
         let exec_slots = Arc::new(Semaphore::new(config.server.max_concurrent_exec.max(1)));
+        let blocking_slots = Arc::new(Semaphore::new(BLOCKING_ADMISSION_SLOTS));
 
         // Fail fast when workspace-scoped sessions cannot be jailed.
         PathGuard::new(Scope::Workspace, Some(paths.workspace_root.as_path()))
@@ -405,6 +416,7 @@ impl AppState {
             rate_limiter,
             sysinfo: Arc::new(SysInfoService::new()),
             exec_slots,
+            blocking_slots,
             tickets: Mutex::new(HashMap::new()),
             creds: Mutex::new(Arc::new(creds)),
             reload: Mutex::new(ReloadState {
@@ -603,6 +615,23 @@ impl AppState {
     /// Concurrency guard for `exec` (REST and WS share it).
     pub(crate) fn exec_slots(&self) -> Arc<Semaphore> {
         Arc::clone(&self.exec_slots)
+    }
+
+    /// Admission permits for blocking work (jobs beyond this many are shed).
+    pub(crate) fn blocking_slots(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.blocking_slots)
+    }
+
+    /// Runs blocking `rt-core` work under the shared admission budget.
+    ///
+    /// Every handler that enters the blocking pool goes through here so a burst
+    /// of requests cannot saturate it and stall unrelated endpoints.
+    pub(crate) async fn spawn_blocking_admitted<T, F>(&self, work: F) -> ApiResult<T>
+    where
+        F: FnOnce() -> rt_core::Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        crate::middleware::blocking_admitted(&self.blocking_slots, work).await
     }
 
     /// Writes an audit event to the JSONL trail and/or the tracing mirror.

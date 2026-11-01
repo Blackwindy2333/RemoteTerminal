@@ -8,7 +8,7 @@ use rt_core::sysinfo::ProcessQuery;
 use rt_protocol::{ProcessListResponse, QuickStatus, SysInfoSnapshot};
 use serde::Deserialize;
 
-use crate::middleware::{blocking, require_full_scope, session_of, ApiQuery, ApiResult};
+use crate::middleware::{require_full_scope, session_of, ApiQuery, ApiResult};
 use crate::state::AppState;
 
 /// `GET /api/v1/sysinfo/processes?limit=&query=&sort=&descending=`.
@@ -32,7 +32,7 @@ pub(crate) async fn sysinfo(
     let ctx = session_of(&req)?;
     let service = state.sysinfo();
     let app = state.app_info(ctx.scope);
-    Ok(Json(blocking(move || service.snapshot(app)).await?))
+    Ok(Json(state.spawn_blocking_admitted(move || service.snapshot(app)).await?))
 }
 
 /// `GET /api/v1/sysinfo/quick` — the cheap version used by dashboards.
@@ -43,7 +43,7 @@ pub(crate) async fn quick(
     let _ctx = session_of(&req)?;
     let service = state.sysinfo();
     let active = state.session_store().count();
-    Ok(Json(blocking(move || service.quick(active)).await?))
+    Ok(Json(state.spawn_blocking_admitted(move || service.quick(active)).await?))
 }
 
 /// `GET /api/v1/sysinfo/processes` — sampled task list.
@@ -66,5 +66,5 @@ pub(crate) async fn processes(
         sort: query.sort.unwrap_or_else(|| "cpu".to_string()),
         descending: query.descending.unwrap_or(true),
     };
-    Ok(Json(blocking(move || service.processes(&spec)).await?))
+    Ok(Json(state.spawn_blocking_admitted(move || service.processes(&spec)).await?))
 }

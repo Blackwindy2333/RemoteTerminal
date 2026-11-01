@@ -94,6 +94,12 @@ impl ApiErr {
     pub(crate) fn message(&self) -> &str {
         &self.0.error.message
     }
+
+    /// HTTP status this error will be answered with.
+    #[cfg(test)]
+    pub(crate) fn status(&self) -> u16 {
+        self.0.status()
+    }
 }
 
 impl From<RtError> for ApiErr {
@@ -134,18 +140,61 @@ pub(crate) fn error_response(body: ApiErrorBody) -> Response {
     response
 }
 
-/// Runs blocking `rt-core` work on the blocking pool and maps its error type.
-pub(crate) async fn blocking<T, F>(work: F) -> ApiResult<T>
+
+/// How long a request may wait for a free blocking worker before it is shed.
+pub(crate) const BLOCKING_ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Reserves one admission permit, or sheds the caller after the wait budget.
+///
+/// Long-lived blocking jobs (uploads, websocket streams) hold this permit for
+/// their whole lifetime, so a slow client still counts against the budget
+/// instead of occupying a worker invisibly.
+pub(crate) async fn admit(
+    slots: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> ApiResult<tokio::sync::OwnedSemaphorePermit> {
+    match tokio::time::timeout(BLOCKING_ADMISSION_WAIT, slots.clone().acquire_owned()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(ApiErr::new(
+            ErrorCode::Unavailable,
+            "the server is shutting down",
+        )),
+        Err(_) => {
+            tracing::warn!(target: "server", "shedding a request: every blocking worker is busy");
+            Err(ApiErr::new(
+                ErrorCode::Unavailable,
+                "the server is busy; retry shortly",
+            )
+            .with_retry_after(1))
+        }
+    }
+}
+
+/// Runs blocking `rt-core` work while holding an admission permit.
+///
+/// The permit is reserved before the job is queued, so a burst of requests
+/// cannot pile up behind a saturated blocking pool: past the wait budget the
+/// request is shed with `503` and a retry hint instead of waiting forever.
+pub(crate) async fn blocking_admitted<T, F>(
+    slots: &std::sync::Arc<tokio::sync::Semaphore>,
+    work: F,
+) -> ApiResult<T>
 where
     F: FnOnce() -> rt_core::Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    match tokio::task::spawn_blocking(work).await {
+    let permit = admit(slots).await?;
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(err)) => Err(err.into()),
         Err(join) => Err(ApiErr::internal(format!("worker task failed: {join}"))),
     }
 }
+
 
 /// Converts an `RtError` into the WS error payload.
 pub(crate) fn api_detail(err: RtError) -> rt_protocol::ApiErrorDetail {
@@ -753,4 +802,49 @@ fn primary_local_ip() -> Option<IpAddr> {
         socket.connect("8.8.8.8:80").ok()?;
         socket.local_addr().ok().map(|addr| addr.ip())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn admit_sheds_the_caller_when_every_slot_is_taken() {
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let held: Vec<_> = (0..2)
+            .map(|_| slots.clone().try_acquire_owned().expect("free permit"))
+            .collect();
+
+        let started = std::time::Instant::now();
+        let err = admit(&slots).await.expect_err("must shed");
+        assert_eq!(err.status(), 503, "load shedding answers 503");
+        assert!(
+            started.elapsed() >= BLOCKING_ADMISSION_WAIT,
+            "the caller waits for the budget before it is shed"
+        );
+
+        drop(held);
+        assert!(admit(&slots).await.is_ok(), "the permit is released again");
+    }
+
+    #[tokio::test]
+    async fn blocking_admitted_returns_the_work_result() {
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let value = blocking_admitted(&slots, || Ok(41 + 1)).await.expect("ran");
+        assert_eq!(value, 42);
+        // The permit is dropped when the job finishes.
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn blocking_admitted_reports_core_errors() {
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let err = blocking_admitted(&slots, || -> rt_core::Result<()> {
+            Err(RtError::NotFound("nothing here".to_string()))
+        })
+        .await
+        .expect_err("error surfaces");
+        assert_eq!(err.status(), 404);
+        assert_eq!(slots.available_permits(), 1);
+    }
 }

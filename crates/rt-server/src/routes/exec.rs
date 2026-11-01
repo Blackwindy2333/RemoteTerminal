@@ -9,7 +9,7 @@ use rt_protocol::error::ErrorCode;
 use rt_protocol::{ExecRequest, ExecResult, ShellListResponse};
 
 use crate::middleware::{
-    blocking, json_body, req_id, require_full_scope, session_of, ApiErr, ApiResult,
+    json_body, req_id, require_full_scope, session_of, ApiErr, ApiResult,
 };
 use crate::state::AppState;
 
@@ -19,8 +19,8 @@ use super::auth::json_limit;
 ///
 /// Discovery is harmless, so workspace sessions may call it; running a command
 /// is full-scope only.
-pub(crate) async fn shells() -> ApiResult<Json<ShellListResponse>> {
-    Ok(Json(blocking(exec::available_shells).await?))
+pub(crate) async fn shells(State(state): State<Arc<AppState>>) -> ApiResult<Json<ShellListResponse>> {
+    Ok(Json(state.spawn_blocking_admitted(exec::available_shells).await?))
 }
 
 /// `POST /api/v1/exec` — runs one command and answers when it finished.
@@ -49,11 +49,12 @@ pub(crate) async fn run(
     let summary = body.clone();
     let shell_label = body.shell.display_name().to_string();
 
-    let result = blocking(move || {
-        let _permit = permit;
-        exec::run(&guard, &body, &limits)
-    })
-    .await;
+    let result = state
+        .spawn_blocking_admitted(move || {
+            let _permit = permit;
+            exec::run(&guard, &body, &limits)
+        })
+        .await;
 
     match &result {
         Ok(out) => {

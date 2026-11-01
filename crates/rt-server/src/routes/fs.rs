@@ -27,7 +27,7 @@ use rt_protocol::{
 };
 
 use crate::middleware::{
-    blocking, json_body, req_id, session_of, ApiErr, ApiQuery, ApiResult, ReqId,
+    json_body, req_id, session_of, ApiErr, ApiQuery, ApiResult, ReqId,
 };
 use crate::state::AppState;
 use crate::streams;
@@ -78,7 +78,7 @@ pub(crate) async fn roots(
 ) -> ApiResult<Json<FsRoots>> {
     let ctx = session_of(&req)?;
     let guard = state.guard(ctx.scope)?;
-    Ok(Json(blocking(move || fsops::roots(&guard)).await?))
+    Ok(Json(state.spawn_blocking_admitted(move || fsops::roots(&guard)).await?))
 }
 
 /// `GET /api/v1/fs/list?path=` — one directory listing.
@@ -95,7 +95,7 @@ pub(crate) async fn list(
         .unwrap_or_else(|| state.default_list_path(&guard));
     let limits = state.fs_limits();
     Ok(Json(
-        blocking(move || fsops::list(&guard, &path, &limits)).await?,
+        state.spawn_blocking_admitted(move || fsops::list(&guard, &path, &limits)).await?,
     ))
 }
 
@@ -111,7 +111,7 @@ pub(crate) async fn stat(
         .path
         .filter(|p| !p.trim().is_empty())
         .unwrap_or_else(|| state.default_list_path(&guard));
-    Ok(Json(blocking(move || fsops::stat(&guard, &path)).await?))
+    Ok(Json(state.spawn_blocking_admitted(move || fsops::stat(&guard, &path)).await?))
 }
 
 /// `POST /api/v1/fs/mkdir` — creates one directory.
@@ -125,7 +125,7 @@ pub(crate) async fn mkdir(
     let body: MkdirRequest = json_body(req, json_limit(&cfg.server.max_json_kb)).await?;
     let target = body.path.clone();
     let guard = state.guard(ctx.scope)?;
-    let result = blocking(move || fsops::mkdir(&guard, &body)).await;
+    let result = state.spawn_blocking_admitted(move || fsops::mkdir(&guard, &body)).await;
     audit_fs(&state, &ctx, "fs.mkdir", &target, result.as_ref().err(), None, &request_id);
     Ok(Json(result?))
 }
@@ -141,7 +141,7 @@ pub(crate) async fn delete(
     let body: DeleteRequest = json_body(req, json_limit(&cfg.server.max_json_kb)).await?;
     let target = body.paths.join(", ");
     let guard = state.guard(ctx.scope)?;
-    let result = blocking(move || fsops::delete(&guard, &body)).await;
+    let result = state.spawn_blocking_admitted(move || fsops::delete(&guard, &body)).await;
     audit_fs(&state, &ctx, "fs.delete", &target, result.as_ref().err(), None, &request_id);
     Ok(Json(result?))
 }
@@ -157,7 +157,7 @@ pub(crate) async fn rename(
     let body: RenameRequest = json_body(req, json_limit(&cfg.server.max_json_kb)).await?;
     let target = format!("{} -> {}", body.from, body.to);
     let guard = state.guard(ctx.scope)?;
-    let result = blocking(move || fsops::rename(&guard, &body)).await;
+    let result = state.spawn_blocking_admitted(move || fsops::rename(&guard, &body)).await;
     audit_fs(&state, &ctx, "fs.rename", &target, result.as_ref().err(), None, &request_id);
     result?;
     Ok(Json(Ack::with_message("renamed")))
@@ -174,7 +174,7 @@ pub(crate) async fn copy(
     let body: CopyRequest = json_body(req, json_limit(&cfg.server.max_json_kb)).await?;
     let target = format!("{} -> {}", body.from, body.to);
     let guard = state.guard(ctx.scope)?;
-    let result = blocking(move || fsops::copy(&guard, &body)).await;
+    let result = state.spawn_blocking_admitted(move || fsops::copy(&guard, &body)).await;
     audit_fs(&state, &ctx, "fs.copy", &target, result.as_ref().err(), None, &request_id);
     Ok(Json(result?))
 }
@@ -198,7 +198,7 @@ pub(crate) async fn read(
     let length = query.length;
     let display_path = path.clone();
 
-    let result = match blocking(move || fsops::read(&guard, &path, offset, length, &limits)).await
+    let result = match state.spawn_blocking_admitted(move || fsops::read(&guard, &path, offset, length, &limits)).await
     {
         Ok(result) => result,
         Err(err) => {
@@ -265,7 +265,7 @@ pub(crate) async fn download(
     let display_path = path.clone();
     let guard = state.guard(ctx.scope)?;
 
-    let opened = blocking(move || fsops::open_for_read(&guard, &path)).await;
+    let opened = state.spawn_blocking_admitted(move || fsops::open_for_read(&guard, &path)).await;
     let (real_path, file, size) = match opened {
         Ok(found) => found,
         Err(err) => {
@@ -388,7 +388,11 @@ pub(crate) async fn write(
 
     let (mut writer, reader) = streams::channel();
     let task_path = target.clone();
+    // The writer holds a worker for as long as the body streams in, so it has
+    // to take an admission permit before it is queued.
+    let admission = crate::middleware::admit(&state.blocking_slots()).await?;
     let task = tokio::task::spawn_blocking(move || {
+        let _admission = admission;
         fsops::write_stream(&guard, &task_path, reader, overwrite, create_parents, &limits)
     });
 
@@ -475,7 +479,9 @@ pub(crate) async fn upload(
         let task_path = target.clone();
         let task_guard = Arc::clone(&guard);
         let task_limits = Arc::clone(&limits);
+        let admission = crate::middleware::admit(&state.blocking_slots()).await?;
         let task = tokio::task::spawn_blocking(move || {
+            let _admission = admission;
             fsops::write_stream(
                 &task_guard,
                 &task_path,

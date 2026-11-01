@@ -98,3 +98,105 @@ pub(crate) fn build(state: Arc<AppState>) -> Router {
         .fallback(crate::middleware::not_found_fallback)
         .method_not_allowed_fallback(crate::middleware::method_not_allowed_fallback)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::extract::connect_info::MockConnectInfo;
+    use axum::http::{header, Request, StatusCode};
+    use rt_core::config::{Config, ResolvedPaths, UserConfig};
+    use rt_core::logging::LogEventSink;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use tower::ServiceExt;
+
+    use crate::ServerOptions;
+
+    fn test_state(dir: &std::path::Path) -> Arc<AppState> {
+        let mut config = Config::default();
+        config.server.enabled = true;
+        config.server.tls = false;
+        config.server.bind = "127.0.0.1".to_string();
+        config.server.port = 0;
+        config.server.rate_limit_per_min = 1_000_000;
+        config.server.workspace.root = dir.join("workspace");
+        config.server.users = vec![UserConfig {
+            name: "admin".to_string(),
+            password_hash: rt_core::crypto::hash_password("password123").expect("hash"),
+            scope: "full".to_string(),
+            enabled: true,
+        }];
+        let paths = ResolvedPaths::resolve(&config, dir);
+        AppState::new(ServerOptions {
+            config,
+            paths,
+            sink: LogEventSink::new(64),
+            audit: None,
+        })
+        .expect("state")
+    }
+
+    fn peer() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51234)
+    }
+
+    async fn send(app: &Router, request: Request<Body>) -> (StatusCode, serde_json::Value) {
+        let response = app.clone().oneshot(request).await.expect("infallible");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("body");
+        let value = serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn requests_are_shed_when_every_blocking_slot_is_taken() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = test_state(dir.path());
+        let app = build(state.clone()).layer(MockConnectInfo(peer()));
+
+        let login = Request::builder()
+            .method("POST")
+            .uri("/api/v1/auth/login")
+            .header(header::HOST, "127.0.0.1:51234")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"username":"admin","password":"password123"}"#,
+            ))
+            .expect("request");
+        let (status, body) = send(&app, login).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let token = body["access_token"].as_str().expect("token").to_string();
+
+        // Occupy the whole admission budget the way a burst of uploads would.
+        let slots = state.blocking_slots();
+        let held: Vec<_> = (0..crate::state::BLOCKING_ADMISSION_SLOTS)
+            .map(|_| slots.clone().try_acquire_owned().expect("free permit"))
+            .collect();
+
+        let blocked = Request::builder()
+            .uri("/api/v1/fs/roots")
+            .header(header::HOST, "127.0.0.1:51234")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .expect("request");
+        let (status, body) = send(&app, blocked).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["code"], "unavailable", "{body}");
+        assert!(
+            body["error"]["retry_after_secs"].as_u64().unwrap_or(0) >= 1,
+            "the client must be told when to retry: {body}"
+        );
+
+        drop(held);
+        let retry = Request::builder()
+            .uri("/api/v1/fs/roots")
+            .header(header::HOST, "127.0.0.1:51234")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .expect("request");
+        let (status, body) = send(&app, retry).await;
+        assert_ne!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    }
+}
