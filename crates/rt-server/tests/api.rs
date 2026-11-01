@@ -1461,3 +1461,41 @@ async fn file_reads_are_recorded_in_the_audit_trail() {
     assert!(detail.contains("returned=11"), "unexpected detail: {detail}");
     assert!(record["request_id"].as_str().is_some(), "{record}");
 }
+
+#[tokio::test]
+async fn every_response_carries_the_hardening_headers() {
+    let fx = Fixture::with(|_| {});
+    let token = fx.token("worker").await;
+
+    // Public JSON
+    let (status, headers, _) = split(fx.call(get("/healthz")).await).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["x-content-type-options"], "nosniff");
+    assert_eq!(headers["x-frame-options"], "DENY");
+
+    // Authenticated file download (raw binary body)
+    let upload = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/fs/write?path=page.html")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from("<script>alert(1)</script>"))
+        .expect("request");
+    let (status, _, body) = split(fx.call(upload).await).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let download = Request::builder()
+        .uri("/api/v1/fs/download?path=page.html")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("request");
+    let (status, headers, _) = split(fx.call(download).await).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["x-content-type-options"], "nosniff");
+    assert_eq!(headers["referrer-policy"], "no-referrer");
+
+    // Error envelope
+    let (status, headers, _) = split(fx.call(get("/api/v1/fs/roots")).await).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(headers["x-content-type-options"], "nosniff");
+}

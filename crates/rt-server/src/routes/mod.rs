@@ -95,6 +95,9 @@ pub(crate) fn build(state: Arc<AppState>) -> Router {
             state,
             crate::middleware::request_id_layer,
         ))
+        // Hardening headers go on last so they cover every reply, including
+        // the fixed-format error envelopes and the raw file/binary bodies.
+        .layer(layer::from_fn(crate::middleware::security_headers_layer))
         .fallback(crate::middleware::not_found_fallback)
         .method_not_allowed_fallback(crate::middleware::method_not_allowed_fallback)
 }

@@ -196,6 +196,22 @@ where
 }
 
 
+/// Applies headers that keep browsers from sniffing or framing our replies.
+pub(crate) async fn security_headers_layer(req: Request, next: Next) -> Response {
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    response
+}
+
 /// Converts an `RtError` into the WS error payload.
 pub(crate) fn api_detail(err: RtError) -> rt_protocol::ApiErrorDetail {
     let body: ApiErrorBody = err.into();
